@@ -1,0 +1,154 @@
+# Sample swarm config. The default profile talks to a local Ollama server.
+# The grok, opencode, and gemini profiles are help-checked examples.
+# Their parsers and flags were not verified with a live model call.
+# Do not put API keys in this file. Name the environment variable only.
+
+dataDir: .swarm-data
+defaultProfile: default
+defaultWorkerCount: 2
+maxWorkerCount: 5
+allowWorkerCountAboveDefault: false
+defaultMaxAttempts: 2
+maxReviewRounds: 3
+logLevel: info
+writeSnapshot: true
+
+decision:
+  policy: owner
+  quorum: 1
+  ownerRole: reviewer
+
+git:
+  cleanupWorktrees: true
+  preserveOnFailure: true
+  allowPush: false
+  allowMergeToBase: false
+  allowRemotePr: false
+
+providers:
+  ollama:
+    type: openai_compatible
+    baseUrl: http://127.0.0.1:11434/v1
+    model: qwen2.5-coder:7b
+    apiKeyEnv: OLLAMA_API_KEY
+    apiKeyOptional: true
+    jsonMode: json_object
+    capabilities:
+      structuredOutput: true
+      toolCalling: false
+      streaming: false
+      nonInteractive: true
+
+  grok:
+    type: cli
+    command: grok
+    args: ["--output-format", "json", "--cwd", "{cwd}", "--prompt-file", "{promptFile}"]
+    promptTransport: file
+    outputParser: grok-json
+    documentedStatus: help-checked
+    envPass: ["XAI_API_KEY"]
+    capabilities:
+      structuredOutput: false
+      toolCalling: false
+      streaming: false
+      nonInteractive: true
+    notes: >
+      Help text checked on this machine on 2026-10-29. Not invoked against a model.
+      --always-approve is omitted on purpose. --no-auto-update was not in the local
+      help text, so it is omitted too. JSON envelope parsing is best-effort.
+
+  opencode:
+    type: cli
+    command: opencode
+    args: ["run", "--format", "json", "--dir", "{cwd}", "{prompt}"]
+    promptTransport: argv
+    outputParser: opencode-events
+    documentedStatus: help-checked
+    capabilities:
+      structuredOutput: false
+      toolCalling: false
+      streaming: false
+      nonInteractive: true
+    notes: >
+      Help text checked on 2026-10-29. Not invoked against a model.
+      -p is the password flag, not the prompt. On Windows the npm shim is
+      opencode.ps1 and launches opencode.exe. This adapter rejects .cmd, .bat,
+      and .ps1. Point command at opencode.exe if PATH resolves the shim.
+
+  gemini:
+    type: cli
+    command: gemini
+    args: ["--skip-trust", "--output-format", "json", "-p", "{prompt}"]
+    promptTransport: argv
+    outputParser: gemini-json
+    documentedStatus: help-checked
+    envPass: ["GEMINI_API_KEY"]
+    capabilities:
+      structuredOutput: false
+      toolCalling: false
+      streaming: false
+      nonInteractive: true
+    notes: >
+      Help text checked on 2026-10-29. Not invoked against a model.
+      --approval-mode and --yolo exist and are left off. Do not enable yolo
+      in a shared profile. JSON envelope parsing is best-effort.
+
+agents:
+  ollama-planner:
+    role: planner
+    provider: ollama
+  ollama-worker:
+    role: worker
+    provider: ollama
+  ollama-reviewer:
+    role: reviewer
+    provider: ollama
+  grok-planner:
+    role: planner
+    provider: grok
+  grok-worker:
+    role: worker
+    provider: grok
+  grok-reviewer:
+    role: reviewer
+    provider: grok
+  opencode-planner:
+    role: planner
+    provider: opencode
+  opencode-worker:
+    role: worker
+    provider: opencode
+  opencode-reviewer:
+    role: reviewer
+    provider: opencode
+  gemini-planner:
+    role: planner
+    provider: gemini
+  gemini-worker:
+    role: worker
+    provider: gemini
+  gemini-reviewer:
+    role: reviewer
+    provider: gemini
+
+profiles:
+  default:
+    planner: ollama-planner
+    worker: ollama-worker
+    reviewer: ollama-reviewer
+    workerCount: 2
+  grok:
+    planner: grok-planner
+    worker: grok-worker
+    reviewer: grok-reviewer
+    workerCount: 2
+  opencode:
+    planner: opencode-planner
+    worker: opencode-worker
+    reviewer: opencode-reviewer
+    workerCount: 2
+  gemini:
+    planner: gemini-planner
+    worker: gemini-worker
+    reviewer: gemini-reviewer
+    workerCount: 2

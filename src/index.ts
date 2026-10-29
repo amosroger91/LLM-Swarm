@@ -1,0 +1,12 @@
+export { SwarmError } from "./errors.js";
+export { loadConfig, defaultConfig, databasePath } from "./config/load.js";
+export type { SwarmConfig, ProviderConfig, ProviderCapabilities } from "./config/schema.js";
+export { openDatabase } from "./db/connection.js";
+export { Store } from "./db/store.js";
+export { GitWorkspace, MemoryWorkspace } from "./git/workspace.js";
+export { Orchestrator, configProviderResolver } from "./orchestration/service.js";
+export { validatePlan } from "./orchestration/planner.js";
+export { createProvider, registerProviderBuilder } from "./providers/registry.js";
+export { registerOutputParser } from "./providers/parse.js";
+export { createSwarmServer, serveSwarm } from "./mcp/server.js";
+export type { AgentProvider, ProviderRequest, ProviderResponse } from "./providers/types.js";
