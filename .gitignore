@@ -15,5 +15,6 @@ logs/
 *.log
 tmp/
 worktrees/
+workspaces/
 .DS_Store
 Thumbs.db

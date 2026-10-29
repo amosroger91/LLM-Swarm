@@ -29,7 +29,7 @@ providers:
   ollama:
     type: openai_compatible
     baseUrl: http://127.0.0.1:11434/v1
-    model: gemma4:latest
+    model: ${process.env.SWARM_SMOKE_MODEL ?? "qwen2.5-coder:7b"}
     apiKeyOptional: true
     jsonMode: json_object
     timeoutMs: 300000
@@ -85,6 +85,17 @@ git(["add", "README.md"]);
 git(["commit", "-m", "init"]);
 
 const config = loadConfig(configPath);
+config.checks = [
+  {
+    command: process.execPath,
+    args: [
+      "-e",
+      "const fs=require('node:fs'); if(fs.readFileSync('hello.txt','utf8')!=='hello-from-swarm\\n'||fs.readFileSync('README.md','utf8')!=='base\\n') process.exit(1); console.log('Exact file content and unchanged README verified');",
+    ],
+  },
+];
+// Persist the effective config so a second CLI process observes this same job.
+fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
 const logger = createLogger("info", createRedactor([]), (line) => {
   fs.appendFileSync(logPath, `${line}\n`);
 });
@@ -127,7 +138,7 @@ await orchestrator.waitFor(started.job_id);
 const job = store.mustJob(started.job_id);
 process.stdout.write(`TERMINAL ${job.status}\n`);
 process.stdout.write(`${JSON.stringify(orchestrator.result(job.id), null, 2)}\n`);
-const hello = path.join(dataDir, "worktrees", job.id, "_integration", "hello.txt");
+const hello = path.join(repo, "workspaces", job.id, "integration", "hello.txt");
 process.stdout.write(`HELLO_EXISTS ${fs.existsSync(hello)}\n`);
 if (fs.existsSync(hello)) {
   process.stdout.write(`HELLO ${JSON.stringify(fs.readFileSync(hello, "utf8"))}\n`);

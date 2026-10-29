@@ -4,7 +4,7 @@ Local multi-agent orchestration for a software repo, exposed as an MCP server.
 
 ## Overview
 
-LLM Swarm takes one task, asks a planner for a validated plan, and runs up to five workers in isolated git worktrees. A reviewer approves the integrated result or sends back one bounded revision. SQLite is the source of truth for jobs, tasks, chat, votes, and reviews. An optional `swarm.md` file is a generated snapshot. Nothing is pushed, merged to the base branch, or opened as a pull request unless that action is turned on in config. It is off by default.
+LLM Swarm takes one task, asks a planner for a validated plan, and runs up to five workers per job in separate Git worktrees. Each worker gets a complete checkout under the target repository's `workspaces/` directory, its own branch, and the committed output of its dependencies. SQLite is the source of truth for jobs, tasks, chat, votes, and reviews. The coordinator integrates the results, runs configured checks, and asks a reviewer to assess the complete diff. Remote pushes, changes to the base branch, and PR creation are not automated by the swarm.
 
 ## Architecture
 
@@ -17,7 +17,8 @@ MCP client or CLI
  planner workers reviewer
         |
         +--> SQLite  (.swarm-data/swarm.db)
-        +--> git worktrees under dataDir, outside the target repo
+        +--> <target-repo>/workspaces/<job>/agent-<task>-<attempt>/
+        +--> <target-repo>/workspaces/<job>/integration/
         +--> optional dataDir/jobs/<id>/swarm.md
 ```
 
@@ -28,11 +29,12 @@ The scheduler, store, and providers can run without the MCP transport. See [docs
 ```powershell
 npm install
 npm run build
-copy .env.example .env
-npm run mcp
+npm run mcp -- --config config/swarm.example.yaml
 ```
 
-Point an MCP client at the stdio command `npm run mcp`, or `node dist/cli.js mcp` after a build. Pass `--config config/swarm.example.yaml` to use the sample file. With no config file and no `SWARM_CONFIG` variable, the process uses the built-in Ollama profile at `http://127.0.0.1:11434/v1`.
+Point an MCP client at `node dist/cli.js mcp --config config/swarm.example.yaml` after a build. Configure `checks` for the target repository before starting an implementation job. Checks are required by default; a deliberately unverified experiment can set `requireChecks: false`. With no config file and no `SWARM_CONFIG` variable, the process uses the built-in Ollama profile at `http://127.0.0.1:11434/v1`.
+
+The target repository must already have a commit. A typical checked run uses a command such as `node scripts/verify.mjs` from that repository. Commands run directly without a shell; on Windows, use a real executable rather than `npm.cmd`. Install any dependencies the checks require in the worktree or configure an appropriate executable path.
 
 Check a job from another terminal:
 
@@ -53,7 +55,7 @@ Secrets are read from the environment. The database, config, and logs store the 
 | `GEMINI_API_KEY` | optional | Passed to the gemini CLI only when that profile's `envPass` lists it. |
 | `SWARM_CONFIG`   | optional | Path to a YAML config. `--config` wins over this variable.            |
 
-Copy `.env.example` to `.env` for local experiments. `.env` is gitignored. Provider and profile fields are documented in [docs/configuration.md](docs/configuration.md). The sample file is `config/swarm.example.yaml`.
+`.env.example` lists supported variables. Set them in the process environment; the app does not automatically load `.env`. Node's `--env-file` option can load a local file when starting the built CLI. Provider and profile fields are documented in [docs/configuration.md](docs/configuration.md).
 
 ## Usage
 
@@ -107,13 +109,30 @@ test/                      Vitest suite, no network and no real agent CLIs
 ## Notes / conventions
 
 - One local scheduler. SQLite coordinates claims inside that design. It is not a distributed queue.
-- Workers commit in worktrees under `dataDir`, which must sit outside the target repository. The default `.swarm-data` directory is next to the config file, or next to the process working directory when no config file is used.
+- Worktrees live at `<repo>/workspaces/<job>/agent-<task>-<attempt>/`. They are retained by default for inspection. Set `git.cleanupWorktrees: true` to remove successful task worktrees; integration remains available. `dataDir` holds the database and snapshots, separate from worktree storage.
+- The coordinator adds `/workspaces/` to Git's local exclude file. This repository also excludes it from lint, formatting, tests, and source discovery. Other target projects must exclude it from their own build/test globs and watchers; see [workspace setup](docs/workspaces.md).
+- Every job pins its starting commit. Dependent workers inherit prerequisite commits. Independent tasks must own disjoint file areas; explicit dependencies permit sequential edits to the same file.
+- Status and result commands read stored job state without starting a scheduler. Cancellation from another process reaches the active scheduler through SQLite. A database permits one scheduler owner at a time, and recovery only runs after ownership is acquired.
+- Patches are validated before any write, including header consistency, reserved paths, traversal, and symlink/junction checks. CLI tools and configured checks are trusted host processes: worktrees are not an operating-system sandbox.
+- Review cannot approve a truncated diff or prompt. Check results record `passed`, `failed`, or `not_run`; the default configuration refuses unchecked completion.
 - Git commands are argument arrays with `shell: false`. The commit author is set with `GIT_AUTHOR_*` and `GIT_COMMITTER_*` (`LLM Swarm` / `swarm@localhost`). The user's git config is not modified.
 - Agent CLIs are not given a shell. `.cmd`, `.bat`, and `.ps1` shims are rejected. On Windows, point `opencode` at `opencode.exe` if PATH resolves `opencode.ps1`.
 - The grok, opencode, and gemini profiles in the sample config were checked against local `--help` text on 2026-10-29. They were not called against a live model. `--always-approve` and `--yolo` are left off.
 - A predecessor satisfies its dependents when the task is `review`, `revision`, or `done`. `done` is the post-approval state. Treating only `done` as satisfied would deadlock the job-level review.
 - Deleting `swarm.md` does not change job status.
 - `npm audit` reports issues in Vitest 3's test runner (including tinypool). Installing Vitest 5 and ESLint 10 failed on npm 10.9.2 with an arborist `edgesOut` error, so the project stays on Vitest 3 and ESLint 9. Those findings are in the test toolchain, not in the server runtime.
-- This repo was built in `C:\Users\roger\Documents\dev\LLM-Swarm`. The new-project convention asks for a Gitea remote and names the retired host `http://gitea.kscomputing.local:3000`. That host is not the live server. The live host is `https://gitea.kscomputing.com`. No remote was created and nothing was pushed. Create the empty repo and pass the `.com` URL before any push.
+- This project's user-selected remote is [amosroger91/LLM-Swarm](https://github.com/amosroger91/LLM-Swarm). GitHub Actions checks formatting, lint, types, build, and tests on Windows and Linux with Node 22 and 24.
+
+## Validation
+
+```powershell
+npm run format:check
+npm run lint
+npm run typecheck
+npm run build
+npm test
+```
+
+The automated suite uses real temporary Git repositories, mock providers, and separate CLI processes. `npx tsx scripts/ollama-smoke.ts` additionally exercises a live local Ollama model and verifies exact output bytes plus the unchanged base README. Its default model is `qwen2.5-coder:7b`; `SWARM_SMOKE_MODEL` overrides it.
 
 Troubleshooting, backup, and restart behavior are in [docs/troubleshooting.md](docs/troubleshooting.md).

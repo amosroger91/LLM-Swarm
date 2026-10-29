@@ -8,7 +8,7 @@ Load order:
 
 `dataDir` and `database` are resolved relative to the config file. Without a file, `dataDir` is `.swarm-data` under the process working directory. The database path is `database` or `<dataDir>/swarm.db`.
 
-Put `dataDir` outside any repository you pass as `repo_path`. Nested git worktrees inside the target repo are rejected.
+`dataDir` stores SQLite and snapshots. Agent worktrees live under `<repo_path>/workspaces/<job-id>/` independently of `dataDir`. Keep the data directory ignored if it is inside the target repository. See [workspaces.md](workspaces.md) for tool exclusions and retention.
 
 ## Providers
 
@@ -32,7 +32,7 @@ These profiles are not selected by `defaultProfile`. They record flags that appe
 
 On Windows, `opencode` from npm is often `opencode.ps1`. The adapter rejects `.ps1`, `.cmd`, and `.bat`. Set `command` to the sibling `opencode.exe`.
 
-`envPass` is the only way a secret reaches a child process. Names must be identifiers. Values whose names contain `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, or `CREDENTIAL` are redacted from error text.
+`envPass` controls additional environment variables passed to children. Names must be identifiers. Values whose names contain `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, or `CREDENTIAL` are redacted from error text. Both system instructions and the user prompt are delivered through argv, stdin, or a prompt file. CLI executables retain the host user's filesystem permissions, including access to their own saved credentials; the environment allowlist is not a sandbox.
 
 ## Agents and profiles
 
@@ -48,17 +48,20 @@ decision:
   quorum: 1
   ownerRole: reviewer
 git:
-  cleanupWorktrees: true
+  cleanupWorktrees: false
   preserveOnFailure: true
   allowPush: false
   allowMergeToBase: false
   allowRemotePr: false
+requireChecks: true
 checks:
-  - command: npm
-    args: ["test"]
+  - command: node
+    args: ["scripts/verify.mjs"] # use an actual checker from the target project
 ```
 
-Checks run in the integration worktree with `shell: false` and the allowlisted environment. An empty list is success and does not spawn anything.
+Checks run in the integration worktree with `shell: false`, the allowlisted environment, and job cancellation. On Windows, `.cmd`, `.bat`, and `.ps1` shims are rejected; use a real executable, such as Node with the checker script as an argument. Dependencies required by the checker must be available in that checkout.
+
+An empty list records `not_run`. The default `requireChecks: true` fails that job before model review. Set it to `false` only for deliberately unverified runs; the report retains the missing-check evidence. An incomplete diff or review prompt always fails before approval, regardless of `requireChecks`.
 
 ## Limits
 

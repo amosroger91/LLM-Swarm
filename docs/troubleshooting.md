@@ -16,7 +16,7 @@ That is recovery, not a resume. Runs that were `queued` or `running` become `int
 
 - The plan was invalid twice. `swarm_status` shows `failed` and `review_state` `planning_failed`.
 - `worker_count` is above the cap. The error names the cap and `allowWorkerCountAboveDefault`. The count is not silently reduced.
-- `dataDir` is inside the target repository. Move it outside. Nested worktrees fail.
+- The target already tracks files under `workspaces/`, or a workspace ancestor is a symlink/junction. Resolve that conflict before starting a job.
 - `repo_path` is not the git root, or `base_branch` does not exist locally.
 - The provider command was not found, or PATH resolved a `.cmd`, `.bat`, or `.ps1` shim. Point `command` at a real executable. On Windows that is often the `.exe` next to the npm shim.
 - A dependency cycle, or a failed task that leaves dependents blocked, fails the job instead of waiting.
@@ -78,6 +78,14 @@ Tests use temporary directories, an in-memory workspace, a local HTTP mock, and 
 
 `npm audit` can report Vitest 3 issues, including a tinypool advisory. An attempt to move to Vitest 5 and ESLint 10 failed on npm 10.9.2 (`Cannot read properties of null (reading 'edgesOut')` in arborist). The runtime dependencies are the MCP SDK, better-sqlite3, yaml, and zod. ESLint may warn that `eslint-visitor-keys` wants Node `^20.19`, `^22.13`, or `>=24`. This machine is Node v23.10.0. The engines field is `>=22`.
 
+## Missing checks or incomplete review
+
+The default requires automated checks. Add a checker appropriate to the target repository. `requireChecks: false` permits an explicitly unverified experiment and records `not_run` in the final report. A clipped diff or review prompt cannot be approved: increase `maxDiffChars` / `maxPromptChars` or split the job.
+
+## A scheduler is already running
+
+Only one scheduler owns a database at a time. Use `status`, `result`, or `cancel` from other terminals; these do not acquire ownership or run recovery. Stop the existing MCP scheduler before starting another. Recovery detects dead local PIDs, but does not steal another host's ownership record. Do not delete a live ownership record.
+
 ## Where the repo lives
 
-The project is local. The K&S new-project note still mentions `http://gitea.kscomputing.local:3000`. That host is retired. The live Gitea is `https://gitea.kscomputing.com`. Do not push until an empty repo exists there and the URL is confirmed. Do not point `origin` at the `.local` host.
+The user selected [amosroger91/LLM-Swarm](https://github.com/amosroger91/LLM-Swarm) for this project. `origin` points there and GitHub Actions runs the project checks. Agent worktrees belong to each target repository; the swarm does not automatically publish their branches or merge the target's base branch.

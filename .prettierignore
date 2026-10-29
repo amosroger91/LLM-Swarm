@@ -1,0 +1,6 @@
+node_modules/
+dist/
+coverage/
+.swarm-data/
+workspaces/
+package-lock.json

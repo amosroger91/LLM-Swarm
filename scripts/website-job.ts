@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { databasePath, loadConfig } from "../src/config/load.js";
 import { openDatabase } from "../src/db/connection.js";
 import { Store } from "../src/db/store.js";
@@ -36,7 +37,7 @@ providerTimeoutMs: 300000
 checks:
   - command: node
     args:
-      - C:/Users/roger/Documents/dev/LLM-Swarm/scripts/check-site.mjs
+      - ${JSON.stringify(fileURLToPath(new URL("./check-site.mjs", import.meta.url)))}
 logLevel: info
 writeSnapshot: true
 providers:
@@ -163,7 +164,7 @@ await orchestrator.waitFor(started.job_id);
 const job = store.mustJob(started.job_id);
 out(`TERMINAL ${job.status}`);
 out(JSON.stringify(orchestrator.result(job.id), null, 2));
-const site = path.join(dataDir, "worktrees", job.id, "_integration");
+const site = path.join(repo, "workspaces", job.id, "integration");
 out(`SITE ${site}`);
 for (const name of ["index.html", "site.css", "site.js", "README.md"]) {
   const file = path.join(site, name);
