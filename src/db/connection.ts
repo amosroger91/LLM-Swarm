@@ -36,11 +36,13 @@ export function migrate(db: SqliteDatabase): void {
   for (const migration of MIGRATIONS) {
     if (applied.has(migration.version)) continue;
     const run = db.transaction(() => {
+      if (db.prepare("SELECT 1 FROM schema_migrations WHERE version = ?").get(migration.version))
+        return;
       db.exec(migration.sql);
       insert.run(migration.version, migration.name, new Date().toISOString());
     });
     try {
-      run();
+      run.immediate();
     } catch (error) {
       throw new SwarmError(
         `Migration ${migration.version} (${migration.name}) failed: ${errorMessage(error)}`,
@@ -63,7 +65,8 @@ export function withBusyRetry<T>(fn: () => T, attempts = 5): T {
       return fn();
     } catch (error) {
       last = error;
-      if (!isBusyError(error) || attempt === attempts) break;
+      if (!isBusyError(error)) throw error;
+      if (attempt === attempts) break;
     }
   }
   throw new SwarmError(

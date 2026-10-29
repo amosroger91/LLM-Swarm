@@ -100,6 +100,16 @@ export interface CommandRequest {
 }
 
 export function runCommand(request: CommandRequest): Promise<CommandResult> {
+  if (request.signal?.aborted) {
+    return Promise.resolve({
+      code: null,
+      stdout: "",
+      stderr: "",
+      timedOut: false,
+      cancelled: true,
+      truncated: false,
+    });
+  }
   return new Promise((resolve, reject) => {
     let stdout = "";
     let stderr = "";
@@ -191,6 +201,10 @@ export function runCommand(request: CommandRequest): Promise<CommandResult> {
     });
     child.on("close", (code) => {
       finish({ code, stdout, stderr, timedOut, cancelled, truncated });
+    });
+
+    child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
+      if (error.code !== "EPIPE" && error.code !== "ERR_STREAM_DESTROYED") fail(error);
     });
 
     if (request.input !== undefined) {

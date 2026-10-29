@@ -6,7 +6,12 @@ import { Store } from "./db/store.js";
 import { GitWorkspace } from "./git/workspace.js";
 import { createLogger } from "./logging/logger.js";
 import { serveSwarm } from "./mcp/server.js";
-import { Orchestrator, configProviderResolver } from "./orchestration/service.js";
+import {
+  Orchestrator,
+  configProviderResolver,
+  statusPayload,
+  resultPayload,
+} from "./orchestration/service.js";
 import { renderSnapshot, writeSnapshotAtomic } from "./orchestration/snapshot.js";
 import { createRedactor, secretValuesFromEnv } from "./safety/redact.js";
 import { SwarmError, errorMessage } from "./errors.js";
@@ -101,6 +106,25 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (["status", "result", "cancel"].includes(args.command)) {
+    try {
+      const id = requiredId(args.positionals);
+      const result =
+        args.command === "status"
+          ? statusPayload(store, id)
+          : args.command === "result"
+            ? resultPayload(store, id)
+            : store.requestCancel(id);
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } finally {
+      store.close();
+    }
+    return;
+  }
+  if (args.command !== "mcp") {
+    store.close();
+    throw new SwarmError(`Unknown command ${args.command}\n${help()}`, "bad_args");
+  }
   const workspace = new GitWorkspace({
     authorName: config.gitAuthorName,
     authorEmail: config.gitAuthorEmail,
@@ -113,27 +137,6 @@ async function main(): Promise<void> {
     recoverOnStart: true,
   });
 
-  if (args.command === "status") {
-    process.stdout.write(
-      `${JSON.stringify(orchestrator.status(requiredId(args.positionals)), null, 2)}\n`,
-    );
-    store.close();
-    return;
-  }
-  if (args.command === "result") {
-    process.stdout.write(
-      `${JSON.stringify(orchestrator.result(requiredId(args.positionals)), null, 2)}\n`,
-    );
-    store.close();
-    return;
-  }
-  if (args.command === "cancel") {
-    process.stdout.write(
-      `${JSON.stringify(orchestrator.cancel(requiredId(args.positionals)), null, 2)}\n`,
-    );
-    store.close();
-    return;
-  }
   if (args.command === "mcp") {
     const stop = (): void => {
       void orchestrator.shutdown().finally(() => {

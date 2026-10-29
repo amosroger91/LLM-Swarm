@@ -1,18 +1,7 @@
 import { SwarmError } from "../errors.js";
 
 export function combineSignals(signals: AbortSignal[]): AbortSignal {
-  const controller = new AbortController();
-  const abortFrom = (signal: AbortSignal): void => {
-    if (!controller.signal.aborted) controller.abort(signal.reason);
-  };
-  for (const signal of signals) {
-    if (signal.aborted) {
-      abortFrom(signal);
-      break;
-    }
-    signal.addEventListener("abort", () => abortFrom(signal), { once: true });
-  }
-  return controller.signal;
+  return AbortSignal.any(signals);
 }
 
 export async function withTimeout<T>(
@@ -21,6 +10,7 @@ export async function withTimeout<T>(
   signal: AbortSignal,
 ): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
   void work.then(
     () => undefined,
     () => undefined,
@@ -37,6 +27,7 @@ export async function withTimeout<T>(
         reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "aborted";
       reject(new SwarmError(message, message === "cancelled" ? "cancelled" : "aborted"));
     };
+    onAbort = fail;
     if (signal.aborted) {
       fail();
       return;
@@ -47,5 +38,6 @@ export async function withTimeout<T>(
     return await Promise.race([work, timeout, aborted]);
   } finally {
     if (timer) clearTimeout(timer);
+    if (onAbort) signal.removeEventListener("abort", onAbort);
   }
 }

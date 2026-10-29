@@ -72,6 +72,7 @@ export class Orchestrator {
   ) {
     this.logger = options.logger ?? silentLogger;
     this.checks = options.checks ?? createChecksRunner(config);
+    this.store.acquireScheduler();
     if (options.recoverOnStart !== false) {
       const recovered = this.store.recoverInterrupted();
       if (recovered.jobs > 0 || recovered.runs > 0) {
@@ -92,6 +93,7 @@ export class Orchestrator {
       task: input.task,
       repoPath: context.root,
       baseBranch: context.baseBranch,
+      baseCommit: context.baseCommit,
       workerCount,
       configProfile: profileName,
       dryRun: input.dryRun ?? profile.dryRun ?? false,
@@ -122,7 +124,13 @@ export class Orchestrator {
     this.controllers.set(jobId, cancel);
     const timeout = AbortSignal.timeout(this.config.jobTimeoutMs);
     const signal = combineSignals([cancel.signal, timeout]);
+    const pollCancellation = (): void => {
+      if (this.store.mustJob(jobId).status === "cancel_requested") cancel.abort("cancelled");
+    };
+    const cancellationPoll = setInterval(pollCancellation, 100);
+    cancellationPoll.unref();
     try {
+      pollCancellation();
       const job = this.store.mustJob(jobId);
       if (job.status === "planning") await this.plan(jobId, signal);
       let current = this.store.mustJob(jobId);
@@ -145,7 +153,23 @@ export class Orchestrator {
       if (cancel.signal.aborted) this.finishCancelled(jobId);
       else this.fail(jobId, errorMessage(error));
     } finally {
+      clearInterval(cancellationPoll);
       this.controllers.delete(jobId);
+      const ended = this.store.mustJob(jobId);
+      if (["failed", "cancelled"].includes(ended.status)) {
+        await this.cleanupSafely(jobId, true);
+        this.store.transitionJob(jobId, ended.status, {
+          finalReport: JSON.stringify(
+            this.terminalReport(
+              jobId,
+              ended.error ?? "Job stopped",
+              ended.status,
+              ended.error,
+              ended.reviewState ?? ended.status,
+            ),
+          ),
+        });
+      }
       this.writeSnapshot(jobId);
     }
   }
@@ -223,19 +247,16 @@ export class Orchestrator {
   }
 
   cancel(jobId: string): { job_id: string; status: string } {
-    const job = this.store.mustJob(jobId);
-    if (isTerminalJob(job.status)) return { job_id: jobId, status: job.status };
-    if (job.status !== "cancel_requested") {
-      this.store.transitionJob(jobId, "cancel_requested");
-    }
-    this.controllers.get(jobId)?.abort("cancelled");
-    return { job_id: jobId, status: "cancel_requested" };
+    const result = this.store.requestCancel(jobId);
+    if (result.status === "cancel_requested") this.controllers.get(jobId)?.abort("cancelled");
+    return result;
   }
 
   async shutdown(): Promise<void> {
     for (const controller of this.controllers.values()) controller.abort("cancelled");
     await Promise.allSettled([...this.inflight.values()]);
     this.store.recoverInterrupted();
+    this.store.releaseScheduler();
   }
 
   private profileSnapshots(profile: ProfileConfig): Array<{
@@ -266,6 +287,13 @@ export class Orchestrator {
     const profile = this.store.profileForRole(jobId, "planner");
     const provider = this.providers.forProfile(profile);
     const context = await this.workspace.assertRepo(job.repoPath, job.baseBranch);
+    const baseCommit = this.store.pinBaseCommit(jobId, context.baseCommit);
+    const sourceContext = await this.workspace.readContext(
+      job.repoPath,
+      baseCommit,
+      [],
+      Math.floor(this.config.maxPromptChars / 2),
+    );
     const profiles = this.describeProfiles();
     let repairErrors: string[] | undefined;
     let lastOutput = "";
@@ -282,7 +310,7 @@ export class Orchestrator {
               task: job.task,
               repo: context.root,
               baseBranch: context.baseBranch,
-              context: context.summary,
+              context: sourceContext,
               profiles,
               repairErrors,
             }),
@@ -450,8 +478,22 @@ export class Orchestrator {
         this.settle(claim, "cancelled", "cancelled", false);
         return;
       }
-      const repoContext = await this.workspace.assertRepo(job.repoPath, job.baseBranch);
-      let baseCommit = repoContext.baseCommit;
+      let baseCommit =
+        job.baseCommit ??
+        this.store.pinBaseCommit(
+          jobId,
+          (await this.workspace.assertRepo(job.repoPath, job.baseBranch)).baseCommit,
+        );
+      const dependencyIds = this.dependencyAncestors(jobId, claim.task.id);
+      const worktrees = this.store.listWorktrees(jobId);
+      const dependencyCommits = [...dependencyIds].map((id) => {
+        const worktree = [...worktrees]
+          .reverse()
+          .find((item) => item.taskId === id && item.headCommit);
+        if (!worktree?.headCommit)
+          throw new SwarmError(`Dependency ${id} has no successful commit`, "dependency_missing");
+        return worktree.headCommit;
+      });
       if (claim.task.kind === "revision" && job.integrationBranch) {
         const integrated = await this.workspace.commitForBranch(
           job.repoPath,
@@ -466,21 +508,37 @@ export class Orchestrator {
         stableId: claim.task.stableId,
         attempt: claim.task.attemptCount,
         baseCommit,
+        dependencyCommits: claim.task.kind === "revision" ? [] : dependencyCommits,
+        signal,
       });
       this.store.attachWorkspace(claim.run.id, workspacePath);
       const provider = this.providers.forProfile(profile);
-      const context = repoContext;
+      const contextAreas = this.store
+        .listTasks(jobId)
+        .filter((task) => task.id === claim.task.id || dependencyIds.has(task.id))
+        .flatMap((task) => task.fileAreas);
+      const sourceContext = await this.workspace.readContext(
+        workspacePath.path,
+        workspacePath.baseCommit,
+        contextAreas,
+        Math.floor(this.config.maxPromptChars / 2),
+      );
       const response = await withTimeout(
         provider.complete({
-          system: workerSystem(profile.config.capabilities, profile.systemPrompt ?? undefined),
+          system: workerSystem(
+            profile.config.capabilities,
+            profile.systemPrompt ?? undefined,
+            profile.config.type === "cli",
+          ),
           prompt: clip(
             workerUserPrompt({
               task: claim.task,
               goal: job.goal,
               jobTask: job.task,
-              context: context.summary,
+              context: sourceContext,
               messages: this.store.listMessages(jobId),
               decisions: this.store.listDecisions(jobId),
+              canEditFiles: profile.config.type === "cli",
             }),
             this.config.maxPromptChars,
           ),
@@ -510,7 +568,10 @@ export class Orchestrator {
         message: `swarm: ${claim.task.stableId} attempt ${claim.task.attemptCount}`,
         patch: result.patch,
         dropPaths: this.dropPathsFor(jobId, claim.task),
+        allowedPaths: claim.task.kind === "revision" ? undefined : claim.task.fileAreas,
+        signal,
       });
+      signal.throwIfAborted();
       this.store.finishRun({
         runId: claim.run.id,
         taskId: claim.task.id,
@@ -651,15 +712,21 @@ export class Orchestrator {
       return "failed";
     }
     this.store.transitionJob(jobId, "review", { reviewRound: round, reviewState: "in_review" });
-    const context = await this.workspace.assertRepo(job.repoPath, job.baseBranch);
+    const baseCommit =
+      job.baseCommit ??
+      this.store.pinBaseCommit(
+        jobId,
+        (await this.workspace.assertRepo(job.repoPath, job.baseBranch)).baseCommit,
+      );
     const branches = this.integrationBranches(jobId);
     const integration = await this.workspace.integrate({
       repoRoot: job.repoPath,
       dataDir: path.resolve(this.config.dataDir),
       jobId,
-      baseCommit: context.baseCommit,
+      baseCommit,
       branches,
       maxDiffChars: this.config.maxDiffChars,
+      signal,
     });
     this.store.insertArtifact({
       jobId,
@@ -676,7 +743,31 @@ export class Orchestrator {
       return "failed";
     }
     this.store.transitionJob(jobId, "review", { integrationBranch: integration.branch });
-    const checks = await this.checks(integration.path);
+    if (integration.diffTruncated) {
+      this.fail(
+        jobId,
+        "Review cannot approve a truncated integration diff. Increase maxDiffChars or split the job.",
+      );
+      return "failed";
+    }
+    const checks = await this.checks(integration.path, signal);
+    signal.throwIfAborted();
+    this.store.insertArtifact({
+      jobId,
+      kind: "checks",
+      path: integration.path,
+      summary: JSON.stringify({
+        status: checks.status ?? (checks.ok ? "passed" : "failed"),
+        summary: checks.summary,
+      }),
+    });
+    if (checks.status === "not_run" && this.config.requireChecks) {
+      this.fail(
+        jobId,
+        "No checks configured. Configure checks or explicitly set requireChecks: false for an unverified run.",
+      );
+      return "failed";
+    }
     if (!checks.ok) {
       return this.reject(jobId, round, "Checks failed", [
         {
@@ -688,21 +779,26 @@ export class Orchestrator {
     }
     const profile = this.store.profileForRole(jobId, "reviewer");
     const provider = this.providers.forProfile(profile);
+    const reviewPrompt = reviewerUserPrompt({
+      goal: job.goal,
+      criteria: job.completionCriteria,
+      tasks: this.store.listTasks(jobId),
+      diff: integration.diff,
+      checks: checks.summary,
+      messages: this.store.listMessages(jobId),
+      decisions: this.store.listDecisions(jobId),
+    });
+    if (reviewPrompt.length > this.config.maxPromptChars) {
+      this.fail(
+        jobId,
+        "Review context exceeds maxPromptChars; refusing approval with missing evidence. Increase the limit or split the job.",
+      );
+      return "failed";
+    }
     const response = await withTimeout(
       provider.complete({
         system: reviewerSystem(profile.systemPrompt ?? undefined),
-        prompt: clip(
-          reviewerUserPrompt({
-            goal: job.goal,
-            criteria: job.completionCriteria,
-            tasks: this.store.listTasks(jobId),
-            diff: integration.diff,
-            checks: checks.summary,
-            messages: this.store.listMessages(jobId),
-            decisions: this.store.listDecisions(jobId),
-          }),
-          this.config.maxPromptChars,
-        ),
+        prompt: reviewPrompt,
         cwd: integration.path,
         signal,
         timeoutMs: this.config.providerTimeoutMs,
@@ -712,6 +808,7 @@ export class Orchestrator {
       this.config.providerTimeoutMs,
       signal,
     );
+    signal.throwIfAborted();
     const parsed = ReviewResultSchema.safeParse(coerceReviewResult(readJson(response)));
     if (!parsed.success) {
       this.fail(
@@ -730,12 +827,12 @@ export class Orchestrator {
         findingsJson: JSON.stringify(parsed.data.findings),
       });
       this.store.markAccepted(jobId);
+      await this.cleanupSafely(jobId, false);
       const report = this.terminalReport(jobId, parsed.data.summary, "completed", null, "approved");
       this.store.transitionJob(jobId, "completed", {
         reviewState: "approved",
         finalReport: JSON.stringify(report),
       });
-      await this.cleanup(jobId, false);
       this.store.postMessage({
         jobId,
         sender: profile.name,
@@ -810,9 +907,16 @@ export class Orchestrator {
 
   private dropPathsFor(jobId: string, task: TaskRecord): string[] {
     if (task.kind === "revision") return [];
+    const ancestors = this.dependencyAncestors(jobId, task.id);
     return this.store
       .listTasks(jobId)
-      .filter((other) => other.id !== task.id && other.kind !== "revision")
+      .filter(
+        (other) =>
+          other.id !== task.id &&
+          other.kind !== "revision" &&
+          !ancestors.has(other.id) &&
+          !this.dependencyAncestors(jobId, other.id).has(task.id),
+      )
       .flatMap((other) => other.fileAreas);
   }
 
@@ -825,7 +929,7 @@ export class Orchestrator {
         .reverse()
         .find((item) => item.taskId === task.id && item.headCommit);
       if (!match) continue;
-      branches.push({ branch: match.branchName, label: task.stableId });
+      branches.push({ branch: match.headCommit!, label: task.stableId });
     }
     return branches;
   }
@@ -851,6 +955,29 @@ export class Orchestrator {
     for (const worktree of this.store.listWorktrees(jobId)) {
       this.store.setWorktreeState(worktree.id, "removed");
     }
+  }
+
+  private async cleanupSafely(jobId: string, failed: boolean): Promise<void> {
+    try {
+      await this.cleanup(jobId, failed);
+    } catch (error) {
+      this.store.addEvent(jobId, "cleanup.failed", "job", jobId, { error: errorMessage(error) });
+      this.logger.warn({ jobId }, `Worktree cleanup requires attention: ${errorMessage(error)}`);
+    }
+  }
+
+  private dependencyAncestors(jobId: string, taskId: string): Set<string> {
+    const map = this.store.dependencyMap(jobId);
+    const found = new Set<string>();
+    const visit = (id: string): void => {
+      for (const dependency of map.get(id) ?? []) {
+        if (found.has(dependency)) continue;
+        visit(dependency);
+        found.add(dependency);
+      }
+    };
+    visit(taskId);
+    return found;
   }
 
   private finishCancelled(jobId: string): void {
@@ -897,7 +1024,6 @@ export class Orchestrator {
       reviewState: "failed",
       finalReport: JSON.stringify(report),
     });
-    void this.cleanup(jobId, true);
   }
 
   private describeProfiles(): string {
@@ -941,6 +1067,14 @@ export class Orchestrator {
       reviewState: job.reviewState,
       error: job.error,
       integrationBranch: job.integrationBranch,
+      baseCommit: job.baseCommit,
+      workspaces: this.store
+        .listWorktrees(jobId)
+        .map((item) => ({ path: item.path, branch: item.branchName, state: item.cleanupState })),
+      checks: this.store
+        .listArtifacts(jobId)
+        .filter((item) => item.kind === "checks")
+        .map((item) => JSON.parse(item.summary) as unknown),
       tasks: this.store.listTasks(jobId).map((task) => ({
         id: task.stableId,
         title: task.title,

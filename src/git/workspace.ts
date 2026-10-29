@@ -4,8 +4,9 @@ import type { GitPolicy } from "../safety/policy.js";
 import { assertRemoteAllowed } from "../safety/policy.js";
 import { SwarmError, errorMessage } from "../errors.js";
 import { allowlistedEnv } from "../safety/redact.js";
-import { assertOutsideRepository, resolveExistingDirectory } from "../safety/paths.js";
+import { isInside, resolveExistingDirectory } from "../safety/paths.js";
 import { runCommand, type CommandResult } from "../safety/process.js";
+import { safeFileTarget, validatedPatchPaths } from "../safety/files.js";
 
 export interface RepoContext {
   root: string;
@@ -27,11 +28,18 @@ export interface IntegrationResult {
   headCommit: string | null;
   conflicts: string[];
   diff: string;
+  diffTruncated?: boolean;
   error?: string;
 }
 
 export interface WorkspacePort {
   assertRepo(repoPath: string, baseBranch?: string): Promise<RepoContext>;
+  readContext(
+    repoPath: string,
+    ref: string,
+    fileAreas: string[],
+    maxChars: number,
+  ): Promise<string>;
   createRunWorkspace(input: {
     repoRoot: string;
     dataDir: string;
@@ -39,6 +47,8 @@ export interface WorkspacePort {
     stableId: string;
     attempt: number;
     baseCommit: string;
+    dependencyCommits?: string[];
+    signal?: AbortSignal;
   }): Promise<RunWorkspace>;
   finalizeRun(input: {
     repoRoot: string;
@@ -46,6 +56,8 @@ export interface WorkspacePort {
     message: string;
     patch?: string;
     dropPaths?: string[];
+    allowedPaths?: string[];
+    signal?: AbortSignal;
   }): Promise<{ headCommit: string | null; changedFiles: string[] }>;
   commitForBranch(repoPath: string, branch: string): Promise<string | null>;
   integrate(input: {
@@ -55,6 +67,7 @@ export interface WorkspacePort {
     baseCommit: string;
     branches: Array<{ branch: string; label: string }>;
     maxDiffChars: number;
+    signal?: AbortSignal;
   }): Promise<IntegrationResult>;
   cleanup(input: {
     repoRoot: string;
@@ -103,25 +116,19 @@ export class GitWorkspace implements WorkspacePort {
     stableId: string;
     attempt: number;
     baseCommit: string;
+    dependencyCommits?: string[];
+    signal?: AbortSignal;
   }): Promise<RunWorkspace> {
-    assertOutsideRepository(input.repoRoot, input.dataDir);
+    const jobRoot = await this.prepareWorkspaces(input.repoRoot, input.jobId);
     const branch = taskBranch(input.jobId, input.stableId, input.attempt);
-    const workspacePath = path.join(
-      input.dataDir,
-      "worktrees",
-      input.jobId,
-      input.stableId,
-      String(input.attempt),
+    assertIdentifier(input.stableId);
+    const workspacePath = path.join(jobRoot, `agent-${input.stableId}-${input.attempt}`);
+    const created = await this.git(
+      input.repoRoot,
+      ["worktree", "add", "-b", branch, workspacePath, input.baseCommit],
+      undefined,
+      input.signal,
     );
-    fs.mkdirSync(path.dirname(workspacePath), { recursive: true });
-    const created = await this.git(input.repoRoot, [
-      "worktree",
-      "add",
-      "-b",
-      branch,
-      workspacePath,
-      input.baseCommit,
-    ]);
     if (created.code !== 0) {
       throw new SwarmError(
         `git worktree add failed for ${branch}: ${created.stderr.trim() || created.stdout.trim()}`,
@@ -129,7 +136,25 @@ export class GitWorkspace implements WorkspacePort {
         true,
       );
     }
-    return { path: workspacePath, branch, baseCommit: input.baseCommit };
+    for (const commit of input.dependencyCommits ?? []) {
+      validateRef(commit);
+      const merge = await this.git(
+        workspacePath,
+        ["merge", "--no-ff", "--no-edit", commit],
+        undefined,
+        input.signal,
+      );
+      if (merge.code !== 0) {
+        await this.git(workspacePath, ["merge", "--abort"]);
+        throw new SwarmError(
+          `Dependency integration conflict for ${input.stableId}: ${merge.stderr || merge.stdout}`,
+          "dependency_conflict",
+        );
+      }
+    }
+    const head = await this.git(workspacePath, ["rev-parse", "HEAD"], undefined, input.signal);
+    if (head.code !== 0) throw new SwarmError("Cannot resolve dependency snapshot", "git");
+    return { path: workspacePath, branch, baseCommit: head.stdout.trim() };
   }
 
   async commitForBranch(repoPath: string, branch: string): Promise<string | null> {
@@ -147,8 +172,26 @@ export class GitWorkspace implements WorkspacePort {
     message: string;
     patch?: string;
     dropPaths?: string[];
+    allowedPaths?: string[];
+    signal?: AbortSignal;
   }): Promise<{ headCommit: string | null; changedFiles: string[] }> {
+    input.signal?.throwIfAborted();
+    const branch = await this.git(input.workspace.path, ["symbolic-ref", "--short", "HEAD"]);
+    if (branch.code !== 0 || branch.stdout.trim() !== input.workspace.branch) {
+      throw new SwarmError("Agent changed its assigned branch", "workspace_changed");
+    }
+    const ancestry = await this.git(input.workspace.path, [
+      "merge-base",
+      "--is-ancestor",
+      input.workspace.baseCommit,
+      "HEAD",
+    ]);
+    if (ancestry.code !== 0)
+      throw new SwarmError("Agent discarded its dependency snapshot", "workspace_changed");
     const patch = input.patch ? normalizePatch(input.patch) : undefined;
+    if (patch) {
+      for (const file of validatedPatchPaths(patch)) safeFileTarget(input.workspace.path, file);
+    }
     const applyPatch = patch ? materializeNewFiles(input.workspace.path, patch) : undefined;
     if (applyPatch && applyPatch.trim()) {
       assertSafePatch(applyPatch);
@@ -169,40 +212,83 @@ export class GitWorkspace implements WorkspacePort {
         throw new SwarmError(`git apply failed: ${applied.stderr.trim()}`, "bad_patch", true);
       }
     }
-    const status = await this.git(input.workspace.path, ["status", "--porcelain"]);
+    const status = await this.git(input.workspace.path, [
+      "status",
+      "--porcelain=v1",
+      "-z",
+      "--untracked-files=all",
+    ]);
     if (status.code !== 0) {
       throw new SwarmError(`git status failed: ${status.stderr.trim()}`, "git", true);
     }
     const changedFiles = porcelainFiles(status.stdout);
     for (const file of changedFiles) {
-      if (file.split(/[\\/]/).includes("..") || path.isAbsolute(file)) {
-        await this.git(input.workspace.path, ["reset", "--hard", "HEAD"]);
-        await this.git(input.workspace.path, ["clean", "-fd"]);
-        throw new SwarmError(`Refusing change outside the worktree: ${file}`, "unsafe_path");
-      }
+      safeFileTarget(input.workspace.path, file);
     }
-    const dropped = await this.dropOwnedByOthers(input.workspace.path, changedFiles, input.dropPaths ?? []);
+    const dropped = await this.dropOwnedByOthers(
+      input.workspace.path,
+      changedFiles,
+      input.dropPaths ?? [],
+    );
     const remainingStatus = dropped.length
-      ? await this.git(input.workspace.path, ["status", "--porcelain"])
+      ? await this.git(input.workspace.path, [
+          "status",
+          "--porcelain=v1",
+          "-z",
+          "--untracked-files=all",
+        ])
       : status;
     if (remainingStatus.code !== 0) {
       throw new SwarmError(`git status failed: ${remainingStatus.stderr.trim()}`, "git", true);
     }
     const remaining = dropped.length ? porcelainFiles(remainingStatus.stdout) : changedFiles;
-    if (remaining.length === 0) {
+    const committed = await this.git(input.workspace.path, [
+      "diff",
+      "--name-only",
+      "--no-renames",
+      "-z",
+      `${input.workspace.baseCommit}..HEAD`,
+    ]);
+    if (committed.code !== 0) throw new SwarmError("Cannot inspect agent commits", "git");
+    const allChanges = [
+      ...new Set([...remaining, ...committed.stdout.split("\0").filter(Boolean)]),
+    ];
+    for (const file of allChanges) {
+      safeFileTarget(input.workspace.path, file);
+      if (
+        input.allowedPaths?.length &&
+        !input.allowedPaths.some((area) => pathMatchesArea(file, area))
+      ) {
+        throw new SwarmError(`Task changed an unowned file: ${file}`, "file_ownership", true);
+      }
+    }
+    if (allChanges.length === 0) {
       const detail = dropped.length
         ? `The only changes were files owned by other tasks (${dropped.join(", ")}). Return a diff that creates this task's own files.`
         : "No files changed. Return status done and a unified diff that creates or edits the required files. Every added line must start with +.";
       throw new SwarmError(detail, "no_change", true);
     }
-    const add = await this.git(input.workspace.path, ["add", "--all"]);
-    if (add.code !== 0) throw new SwarmError(`git add failed: ${add.stderr.trim()}`, "git", true);
-    const commit = await this.git(input.workspace.path, ["commit", "-m", input.message]);
-    if (commit.code !== 0)
-      throw new SwarmError(`git commit failed: ${commit.stderr.trim()}`, "git", true);
+    input.signal?.throwIfAborted();
+    if (remaining.length > 0) {
+      const add = await this.git(
+        input.workspace.path,
+        ["add", "--all", "--", ...remaining],
+        undefined,
+        input.signal,
+      );
+      if (add.code !== 0) throw new SwarmError(`git add failed: ${add.stderr.trim()}`, "git", true);
+      const commit = await this.git(
+        input.workspace.path,
+        ["commit", "-m", input.message],
+        undefined,
+        input.signal,
+      );
+      if (commit.code !== 0)
+        throw new SwarmError(`git commit failed: ${commit.stderr.trim()}`, "git", true);
+    }
     const head = await this.git(input.workspace.path, ["rev-parse", "HEAD"]);
     if (head.code !== 0) throw new SwarmError("Cannot read worktree HEAD", "git", true);
-    return { headCommit: head.stdout.trim(), changedFiles: remaining };
+    return { headCommit: head.stdout.trim(), changedFiles: allChanges };
   }
 
   private async dropOwnedByOthers(
@@ -222,7 +308,7 @@ export class GitWorkspace implements WorkspacePort {
           throw new SwarmError(`Cannot restore ${file}: ${restored.stderr.trim()}`, "git", true);
         }
       } else {
-        fs.rmSync(path.join(workspacePath, file), { recursive: true, force: true });
+        fs.rmSync(safeFileTarget(workspacePath, file), { recursive: true, force: true });
       }
     }
     return dropped;
@@ -235,21 +321,19 @@ export class GitWorkspace implements WorkspacePort {
     baseCommit: string;
     branches: Array<{ branch: string; label: string }>;
     maxDiffChars: number;
+    signal?: AbortSignal;
   }): Promise<IntegrationResult> {
-    assertOutsideRepository(input.repoRoot, input.dataDir);
+    const jobRoot = await this.prepareWorkspaces(input.repoRoot, input.jobId);
     const branch = integrationBranch(input.jobId);
-    const workspacePath = path.join(input.dataDir, "worktrees", input.jobId, "_integration");
-    await this.git(input.repoRoot, ["worktree", "remove", "--force", workspacePath]);
-    await this.git(input.repoRoot, ["branch", "-D", branch]);
-    fs.rmSync(workspacePath, { recursive: true, force: true });
-    const created = await this.git(input.repoRoot, [
-      "worktree",
-      "add",
-      "-b",
-      branch,
-      workspacePath,
-      input.baseCommit,
-    ]);
+    const workspacePath = path.join(jobRoot, "integration");
+    if (fs.existsSync(workspacePath))
+      await this.removeWorktree(input.repoRoot, workspacePath, branch);
+    const created = await this.git(
+      input.repoRoot,
+      ["worktree", "add", "-b", branch, workspacePath, input.baseCommit],
+      undefined,
+      input.signal,
+    );
     if (created.code !== 0) {
       return {
         ok: false,
@@ -263,18 +347,13 @@ export class GitWorkspace implements WorkspacePort {
     }
     const conflicts: string[] = [];
     for (const item of input.branches) {
-      let merge = await this.git(workspacePath, ["merge", "--no-ff", "--no-edit", item.branch]);
-      if (merge.code !== 0 && item.label.startsWith("revision-")) {
-        await this.git(workspacePath, ["merge", "--abort"]);
-        merge = await this.git(workspacePath, [
-          "merge",
-          "--no-ff",
-          "--no-edit",
-          "-X",
-          "theirs",
-          item.branch,
-        ]);
-      }
+      validateRef(item.branch);
+      const merge = await this.git(
+        workspacePath,
+        ["merge", "--no-ff", "--no-edit", item.branch],
+        undefined,
+        input.signal,
+      );
       if (merge.code !== 0) {
         await this.git(workspacePath, ["merge", "--abort"]);
         conflicts.push(item.label);
@@ -292,7 +371,14 @@ export class GitWorkspace implements WorkspacePort {
     const head = await this.git(workspacePath, ["rev-parse", "HEAD"]);
     const diff = await this.git(workspacePath, ["diff", "--stat", `${input.baseCommit}..HEAD`]);
     const full = await this.git(workspacePath, ["diff", `${input.baseCommit}..HEAD`]);
-    const text = `${diff.stdout}\n${full.stdout}`.slice(0, input.maxDiffChars);
+    if ([head, diff, full].some((result) => result.code !== 0 || result.truncated)) {
+      throw new SwarmError("Cannot obtain a complete integration diff", "review_incomplete");
+    }
+    const fullText = `${diff.stdout}\n${full.stdout}`;
+    const diffTruncated = fullText.length > input.maxDiffChars;
+    const text = diffTruncated
+      ? `${fullText.slice(0, input.maxDiffChars)}\n[DIFF TRUNCATED: REVIEW INCOMPLETE]`
+      : fullText;
     return {
       ok: true,
       branch,
@@ -300,6 +386,7 @@ export class GitWorkspace implements WorkspacePort {
       headCommit: head.stdout.trim(),
       conflicts: [],
       diff: text,
+      diffTruncated,
     };
   }
 
@@ -309,14 +396,119 @@ export class GitWorkspace implements WorkspacePort {
   }): Promise<void> {
     for (const worktree of input.worktrees) {
       if (worktree.preserve) continue;
-      await this.git(input.repoRoot, ["worktree", "remove", "--force", worktree.path]);
-      await this.git(input.repoRoot, ["branch", "-D", worktree.branch]);
-      fs.rmSync(worktree.path, { recursive: true, force: true });
+      await this.removeWorktree(input.repoRoot, worktree.path, worktree.branch);
     }
   }
 
   refuseRemote(action: "push" | "merge-to-base" | "remote-pr"): void {
     assertRemoteAllowed(this.options.policy, action);
+  }
+
+  private async prepareWorkspaces(repoRoot: string, jobId: string): Promise<string> {
+    assertIdentifier(jobId);
+    const tracked = await this.git(repoRoot, ["ls-files", "--", "workspaces"]);
+    if (tracked.code !== 0 || tracked.stdout.trim()) {
+      throw new SwarmError(
+        "The workspaces directory must not contain tracked project files",
+        "bad_workspace_root",
+      );
+    }
+    const common = await this.git(repoRoot, [
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir",
+    ]);
+    if (common.code !== 0) throw new SwarmError("Cannot locate Git exclusions", "git");
+    const exclude = path.join(common.stdout.trim(), "info", "exclude");
+    fs.mkdirSync(path.dirname(exclude), { recursive: true });
+    const existing = fs.existsSync(exclude) ? fs.readFileSync(exclude, "utf8") : "";
+    if (!existing.split(/\r?\n/).includes("/workspaces/"))
+      fs.appendFileSync(exclude, "\n# LLM Swarm agent workspaces\n/workspaces/\n");
+    const jobRoot = path.join(fs.realpathSync(repoRoot), "workspaces", jobId);
+    assertWorkspacePath(repoRoot, jobRoot);
+    fs.mkdirSync(jobRoot, { recursive: true });
+    return jobRoot;
+  }
+
+  private async removeWorktree(
+    repoRoot: string,
+    workspacePath: string,
+    branch: string,
+  ): Promise<void> {
+    assertWorkspacePath(repoRoot, workspacePath);
+    if (!fs.existsSync(workspacePath)) return;
+    const current = await this.git(workspacePath, ["symbolic-ref", "--short", "HEAD"]);
+    const top = await this.git(workspacePath, ["rev-parse", "--show-toplevel"]);
+    const common = await this.git(workspacePath, [
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir",
+    ]);
+    const expected = await this.git(repoRoot, [
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir",
+    ]);
+    if (
+      current.code !== 0 ||
+      current.stdout.trim() !== branch ||
+      top.code !== 0 ||
+      fs.realpathSync(top.stdout.trim()) !== fs.realpathSync(workspacePath) ||
+      common.code !== 0 ||
+      expected.code !== 0 ||
+      common.stdout.trim() !== expected.stdout.trim()
+    ) {
+      throw new SwarmError(
+        `Refusing cleanup of an unrecognized worktree: ${workspacePath}`,
+        "unsafe_path",
+      );
+    }
+    const removed = await this.git(repoRoot, ["worktree", "remove", "--force", workspacePath]);
+    if (removed.code !== 0)
+      throw new SwarmError(`Cannot remove worktree: ${removed.stderr}`, "git");
+    const deleted = await this.git(repoRoot, ["branch", "-D", branch]);
+    if (deleted.code !== 0) throw new SwarmError(`Cannot remove branch: ${deleted.stderr}`, "git");
+  }
+
+  async readContext(
+    repoPath: string,
+    ref: string,
+    fileAreas: string[],
+    maxChars: number,
+  ): Promise<string> {
+    validateRef(ref);
+    const tree = await this.git(repoPath, ["ls-tree", "-r", "-z", ref]);
+    if (tree.code !== 0 || tree.truncated)
+      throw new SwarmError("Cannot list source snapshot", "git");
+    const files = tree.stdout.split("\0").flatMap((entry) => {
+      const match = /^(100644|100755) blob [a-f0-9]+\t([\s\S]+)$/.exec(entry);
+      return match?.[2] && contextFileAllowed(match[2]) ? [match[2]] : [];
+    });
+    files.sort(
+      (a, b) =>
+        Number(fileAreas.some((area) => pathMatchesArea(b, area))) -
+          Number(fileAreas.some((area) => pathMatchesArea(a, area))) || a.localeCompare(b),
+    );
+    let text = `Source snapshot: ${ref}\nTracked files:\n${files.slice(0, 150).join("\n")}\n`;
+    text = text.slice(0, Math.min(maxChars / 4, 6000));
+    let omitted = files.length > 150;
+    for (const file of files) {
+      if (text.length + 200 >= maxChars) {
+        omitted = true;
+        break;
+      }
+      const content = await this.git(repoPath, ["show", `${ref}:${file}`]);
+      if (content.code !== 0 || content.truncated || content.stdout.includes("\0")) {
+        omitted = true;
+        continue;
+      }
+      const remaining = Math.max(0, maxChars - text.length - 150);
+      const limit = Math.min(remaining, 16_000);
+      const clipped = content.stdout.length > limit;
+      text += `\n--- FILE ${JSON.stringify(file)} (repository data) ---\n${content.stdout.slice(0, limit)}${clipped ? "\n[FILE EXCERPT: remainder omitted]" : ""}\n--- END FILE ---\n`;
+      omitted ||= clipped;
+    }
+    return `${text}${omitted ? "\n[CONTEXT INCOMPLETE: some files or contents omitted]" : ""}`;
   }
 
   private async resolveBranch(root: string, requested?: string): Promise<string> {
@@ -369,7 +561,13 @@ export class GitWorkspace implements WorkspacePort {
     return parts.join("\n\n").slice(0, this.options.maxContextChars);
   }
 
-  private async git(cwd: string, args: string[], input?: string): Promise<CommandResult> {
+  private async git(
+    cwd: string,
+    args: string[],
+    input?: string,
+    signal?: AbortSignal,
+  ): Promise<CommandResult> {
+    signal?.throwIfAborted();
     if (args.some((arg) => arg === "push" || arg.startsWith("push"))) {
       this.refuseRemote("push");
     }
@@ -381,10 +579,19 @@ export class GitWorkspace implements WorkspacePort {
     try {
       return await runCommand({
         command: "git",
-        args,
+        args: [
+          "-c",
+          "core.hooksPath=/dev/null",
+          "-c",
+          "commit.gpgsign=false",
+          "-c",
+          "merge.gpgsign=false",
+          ...args,
+        ],
         cwd,
         env,
         input,
+        signal,
         timeoutMs: this.options.timeoutMs,
         maxBytes: 2_000_000,
       });
@@ -395,16 +602,63 @@ export class GitWorkspace implements WorkspacePort {
 }
 
 export function taskBranch(jobId: string, stableId: string, attempt: number): string {
-  const safe = stableId.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 40);
-  return `swarm/${shortId(jobId)}/${safe}/${attempt}`;
+  assertIdentifier(jobId);
+  assertIdentifier(stableId);
+  if (!Number.isInteger(attempt) || attempt < 1)
+    throw new SwarmError("Invalid workspace attempt", "bad_path");
+  return `codex/swarm/${jobId}/${stableId}/${attempt}`;
 }
 
 export function integrationBranch(jobId: string): string {
-  return `swarm/${shortId(jobId)}/integration`;
+  assertIdentifier(jobId);
+  return `codex/swarm/${jobId}/integration`;
 }
 
-function shortId(jobId: string): string {
-  return jobId.replace(/-/g, "").slice(0, 8);
+function assertIdentifier(value: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,80}$/.test(value))
+    throw new SwarmError("Invalid workspace identifier", "bad_path");
+}
+
+function assertWorkspacePath(repoRoot: string, target: string): void {
+  const root = fs.realpathSync(repoRoot);
+  const relative = path.relative(root, path.resolve(target));
+  if (!isInside(path.join(root, "workspaces"), target) || relative === "workspaces") {
+    throw new SwarmError(
+      "Workspace must be below the repository's workspaces directory",
+      "unsafe_path",
+    );
+  }
+  let current = root;
+  for (const part of relative.split(path.sep)) {
+    current = path.join(current, part);
+    try {
+      if (fs.lstatSync(current).isSymbolicLink())
+        throw new SwarmError("Workspace path contains a symbolic link or junction", "unsafe_path");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+}
+
+function contextFileAllowed(file: string): boolean {
+  if (file.split("/").some((part) => /^\.env(?:\.|$)/i.test(part))) return false;
+  if (
+    /(^|\/)(?:\.env(?:\.|$)|\.git|\.swarm-data|workspaces|node_modules|dist|coverage|secrets?|credentials?|certs?)(?:\/|$)/i.test(
+      file,
+    )
+  )
+    return false;
+  if (
+    /(?:lock\.(?:json|yaml)|\.lock$|\.(?:pem|key|pfx|p12|crt|db|sqlite)$|(?:secret|credential|token)[^/]*\.(?:json|ya?ml|txt)$)/i.test(
+      file,
+    )
+  )
+    return false;
+  return (
+    /\.(?:[cm]?[jt]sx?|json|ya?ml|md|txt|css|html|py|go|rs|java|cs|sql|sh|ps1|toml|xml)$/i.test(
+      file,
+    ) || /(?:^|\/)(?:Dockerfile|Makefile|\.gitignore)$/.test(file)
+  );
 }
 
 function validateRef(name: string): void {
@@ -499,23 +753,13 @@ export function normalizePatch(patch: string): string {
 }
 
 export function assertSafePatch(patch: string): void {
-  for (const line of patch.split(/\r?\n/)) {
-    if (!line.startsWith("+++ ") && !line.startsWith("--- ")) continue;
-    const raw = line.slice(4).trim();
-    if (raw === "/dev/null") continue;
-    const normalized = raw.replace(/^[ab]\//, "");
-    if (
-      normalized.startsWith("/") ||
-      /^[A-Za-z]:[\\/]/.test(normalized) ||
-      normalized.split(/[\\/]/).includes("..")
-    ) {
-      throw new SwarmError(`Patch path is outside the worktree: ${normalized}`, "unsafe_path");
-    }
-  }
+  validatedPatchPaths(patch);
 }
 
 /** New-file diffs are written directly so an existing file does not make git apply fail. */
 export function materializeNewFiles(workspacePath: string, patch: string): string {
+  // Validate the complete patch before the first filesystem mutation.
+  for (const file of validatedPatchPaths(patch)) safeFileTarget(workspacePath, file);
   const sections = patch.split(/(?=^diff --git )/m).filter((section) => section.trim());
   const rest: string[] = [];
   for (const section of sections) {
@@ -529,7 +773,7 @@ export function materializeNewFiles(workspacePath: string, patch: string): strin
       continue;
     }
     assertSafePatch(section);
-    const target = path.join(workspacePath, filePath);
+    const target = safeFileTarget(workspacePath, filePath);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, newFileContent(section), "utf8");
   }
@@ -580,17 +824,21 @@ export function pathMatchesArea(file: string, area: string): boolean {
 
 function porcelainFiles(porcelain: string): string[] {
   const files: string[] = [];
-  for (const line of porcelain.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    const file = line.slice(3).trim();
-    const renamed = file.includes(" -> ") ? file.split(" -> ").pop() : file;
-    if (renamed) files.push(renamed.trim());
+  const entries = porcelain.split("\0");
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index]!;
+    if (!entry) continue;
+    files.push(entry.slice(3));
+    if (/^[RC]|^.[RC]/.test(entry)) {
+      const source = entries[++index];
+      if (source) files.push(source);
+    }
   }
   return files;
 }
 
 function listTree(root: string, depth: number, maxEntries: number): string[] {
-  const skip = new Set([".git", "node_modules", "dist", ".swarm-data", "coverage"]);
+  const skip = new Set([".git", "node_modules", "dist", ".swarm-data", "coverage", "workspaces"]);
   const lines: string[] = [];
   const walk = (dir: string, remaining: number, prefix: string): void => {
     if (remaining < 0 || lines.length >= maxEntries) return;
@@ -623,6 +871,10 @@ function readLimited(filePath: string, maxChars: number): string | null {
 
 export class MemoryWorkspace implements WorkspacePort {
   readonly roots = new Map<string, RepoContext>();
+
+  async readContext(repoPath: string, ref: string): Promise<string> {
+    return `Memory repository ${repoPath} at ${ref}`;
+  }
 
   async assertRepo(repoPath: string, baseBranch?: string): Promise<RepoContext> {
     const root = resolveExistingDirectory(repoPath);

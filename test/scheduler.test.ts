@@ -46,7 +46,7 @@ describe("scheduler", () => {
       },
     });
     const started = await orchestrator.startJob({ task: "early", repoPath: repo, dryRun: true });
-    expect(entered).toBe(true);
+    await waitUntil(() => entered, "planner starts asynchronously");
     expect(started.status).toBe("planning");
     expect(orchestrator.result(started.job_id).ready).toBe(false);
     gate.resolve();

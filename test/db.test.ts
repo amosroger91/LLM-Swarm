@@ -44,7 +44,10 @@ describe("database", () => {
       version: number;
       name: string;
     }>;
-    expect(versions).toEqual([{ version: 1, name: "initial" }]);
+    expect(versions).toEqual([
+      { version: 1, name: "initial" },
+      { version: 2, name: "scheduler_ownership_and_pinned_base" },
+    ]);
     expect(db.pragma("foreign_keys", { simple: true })).toBe(1);
     expect(String(db.pragma("journal_mode", { simple: true }))).toBe("wal");
     const reopened = new Store(db);
