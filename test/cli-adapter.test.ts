@@ -107,6 +107,19 @@ function alive(pid: number): boolean {
 }
 
 describe("CLI provider", () => {
+  it.each(["argv", "stdin", "file"] as const)("delivers system instructions through %s", async (transport) => {
+    const dir = tempDir("swarm-cli-system-"); dirs.push(dir);
+    const script = writeScript(dir);
+    const out = path.join(dir, "recorded.txt");
+    const args = transport === "argv" ? [script, "args", out, "{prompt}"]
+      : transport === "file" ? [script, "file", out, "{promptFile}"] : [script, "stdin", out];
+    const provider = new CliProvider(config(process.execPath, args, { promptTransport: transport }), "echo");
+    await provider.complete({ prompt: "user-marker", system: "system-contract-marker", cwd: dir });
+    const recorded = fs.readFileSync(out, "utf8");
+    expect(recorded).toContain("system-contract-marker");
+    expect(recorded).toContain("user-marker");
+    expect(recorded.indexOf("system-contract-marker")).toBeLessThan(recorded.indexOf("user-marker"));
+  });
   it("passes one argv element, drops secrets, and keeps PATH", async () => {
     const dir = tempDir("swarm-cli-");
     dirs.push(dir);

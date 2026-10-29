@@ -35,13 +35,16 @@ export class CliProvider implements AgentProvider {
     const cwd = request.cwd ?? process.cwd();
     const timeoutMs = request.timeoutMs ?? this.config.timeoutMs;
     const transport = this.config.promptTransport;
+    const prompt = request.system
+      ? `SYSTEM INSTRUCTIONS:\n${request.system}\n\nUSER REQUEST:\n${request.prompt}`
+      : request.prompt;
     let promptFile: string | undefined;
     if (transport === "file" || this.config.args.some((arg) => arg.includes("{promptFile}"))) {
       promptFile = path.join(os.tmpdir(), `llm-swarm-prompt-${randomUUID()}.txt`);
-      fs.writeFileSync(promptFile, request.prompt, { encoding: "utf8", mode: 0o600 });
+      fs.writeFileSync(promptFile, prompt, { encoding: "utf8", mode: 0o600 });
     }
     const args = buildArgs(this.config.args, {
-      prompt: transport === "argv" ? request.prompt : "",
+      prompt: transport === "argv" ? prompt : "",
       promptFile,
       cwd,
     });
@@ -54,7 +57,7 @@ export class CliProvider implements AgentProvider {
         args,
         cwd,
         env,
-        input: transport === "stdin" ? request.prompt : undefined,
+        input: transport === "stdin" ? prompt : undefined,
         timeoutMs,
         maxBytes: this.config.maxStdoutBytes,
         signal: request.signal,

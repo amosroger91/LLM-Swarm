@@ -6,6 +6,7 @@ import { SwarmError, errorMessage } from "../errors.js";
 import { allowlistedEnv } from "../safety/redact.js";
 import { assertOutsideRepository, resolveExistingDirectory } from "../safety/paths.js";
 import { runCommand, type CommandResult } from "../safety/process.js";
+import { safeFileTarget, validatedPatchPaths } from "../safety/files.js";
 
 export interface RepoContext {
   root: string;
@@ -149,6 +150,9 @@ export class GitWorkspace implements WorkspacePort {
     dropPaths?: string[];
   }): Promise<{ headCommit: string | null; changedFiles: string[] }> {
     const patch = input.patch ? normalizePatch(input.patch) : undefined;
+    if (patch) {
+      for (const file of validatedPatchPaths(patch)) safeFileTarget(input.workspace.path, file);
+    }
     const applyPatch = patch ? materializeNewFiles(input.workspace.path, patch) : undefined;
     if (applyPatch && applyPatch.trim()) {
       assertSafePatch(applyPatch);
@@ -499,23 +503,13 @@ export function normalizePatch(patch: string): string {
 }
 
 export function assertSafePatch(patch: string): void {
-  for (const line of patch.split(/\r?\n/)) {
-    if (!line.startsWith("+++ ") && !line.startsWith("--- ")) continue;
-    const raw = line.slice(4).trim();
-    if (raw === "/dev/null") continue;
-    const normalized = raw.replace(/^[ab]\//, "");
-    if (
-      normalized.startsWith("/") ||
-      /^[A-Za-z]:[\\/]/.test(normalized) ||
-      normalized.split(/[\\/]/).includes("..")
-    ) {
-      throw new SwarmError(`Patch path is outside the worktree: ${normalized}`, "unsafe_path");
-    }
-  }
+  validatedPatchPaths(patch);
 }
 
 /** New-file diffs are written directly so an existing file does not make git apply fail. */
 export function materializeNewFiles(workspacePath: string, patch: string): string {
+  // Validate the complete patch before the first filesystem mutation.
+  for (const file of validatedPatchPaths(patch)) safeFileTarget(workspacePath, file);
   const sections = patch.split(/(?=^diff --git )/m).filter((section) => section.trim());
   const rest: string[] = [];
   for (const section of sections) {
@@ -529,7 +523,7 @@ export function materializeNewFiles(workspacePath: string, patch: string): strin
       continue;
     }
     assertSafePatch(section);
-    const target = path.join(workspacePath, filePath);
+    const target = safeFileTarget(workspacePath, filePath);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, newFileContent(section), "utf8");
   }
