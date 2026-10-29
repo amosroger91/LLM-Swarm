@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import os from "node:os";
 import { z } from "zod";
 import type { ProviderConfig } from "../config/schema.js";
 import { ProviderConfigSchema } from "../config/schema.js";
@@ -22,6 +23,7 @@ export interface JobRecord {
   task: string;
   repoPath: string;
   baseBranch: string;
+  baseCommit: string | null;
   integrationBranch: string | null;
   workerCount: number;
   configProfile: string | null;
@@ -209,6 +211,7 @@ interface JobRow {
   task: string;
   repo_path: string;
   base_branch: string;
+  base_commit: string | null;
   integration_branch: string | null;
   worker_count: number;
   config_profile: string | null;
@@ -266,6 +269,7 @@ function mapJob(row: JobRow): JobRecord {
     task: row.task,
     repoPath: row.repo_path,
     baseBranch: row.base_branch,
+    baseCommit: row.base_commit,
     integrationBranch: row.integration_branch,
     workerCount: row.worker_count,
     configProfile: row.config_profile,
@@ -314,10 +318,66 @@ function mapTask(row: TaskRow): TaskRecord {
 }
 
 export class Store {
+  private schedulerToken: string | null = null;
   constructor(private readonly db: SqliteDatabase) {}
 
   close(): void {
+    this.releaseScheduler();
     this.db.close();
+  }
+
+  acquireScheduler(): void {
+    this.immediate(() => {
+      const owner = this.db.prepare("SELECT * FROM scheduler_owner WHERE singleton = 1").get() as
+        { token: string; pid: number; hostname: string } | undefined;
+      if (owner) {
+        let alive = owner.hostname !== os.hostname();
+        if (!alive) {
+          try {
+            process.kill(owner.pid, 0);
+            alive = true;
+          } catch (error) {
+            alive = (error as NodeJS.ErrnoException).code !== "ESRCH";
+          }
+        }
+        if (alive)
+          throw new SwarmError(
+            `Scheduler already running on ${owner.hostname} (PID ${owner.pid})`,
+            "scheduler_busy",
+          );
+      }
+      const token = randomUUID();
+      this.db
+        .prepare(
+          "INSERT OR REPLACE INTO scheduler_owner (singleton, token, pid, hostname) VALUES (1, ?, ?, ?)",
+        )
+        .run(token, process.pid, os.hostname());
+      this.schedulerToken = token;
+    });
+  }
+
+  releaseScheduler(): void {
+    if (!this.schedulerToken) return;
+    this.db.prepare("DELETE FROM scheduler_owner WHERE token = ?").run(this.schedulerToken);
+    this.schedulerToken = null;
+  }
+
+  pinBaseCommit(jobId: string, commit: string): string {
+    this.db
+      .prepare("UPDATE jobs SET base_commit = COALESCE(base_commit, ?) WHERE id = ?")
+      .run(commit, jobId);
+    return this.mustJob(jobId).baseCommit!;
+  }
+
+  requestCancel(jobId: string): { job_id: string; status: string } {
+    return this.immediate(() => {
+      const job = this.mustJob(jobId);
+      if (["completed", "failed", "cancelled", "interrupted"].includes(job.status)) {
+        return { job_id: jobId, status: job.status };
+      }
+      if (job.status !== "cancel_requested") this.transitionJob(jobId, "cancel_requested");
+      return { job_id: jobId, status: "cancel_requested" };
+    });
   }
 
   backup(destination: string): Promise<unknown> {
@@ -351,6 +411,7 @@ export class Store {
     task: string;
     repoPath: string;
     baseBranch: string;
+    baseCommit?: string;
     workerCount: number;
     configProfile: string | null;
     dryRun: boolean;
@@ -381,6 +442,7 @@ export class Store {
           now,
         );
       this.addEvent(id, "job.created", "job", id, { status: "planning", dryRun: input.dryRun });
+      if (input.baseCommit) this.pinBaseCommit(id, input.baseCommit);
     });
     return this.mustJob(id);
   }

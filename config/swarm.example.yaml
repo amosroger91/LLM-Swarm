@@ -12,6 +12,9 @@ defaultMaxAttempts: 2
 maxReviewRounds: 3
 logLevel: info
 writeSnapshot: true
+requireChecks: true
+# Configure checks for the target repository. An empty list is reported as NOT RUN.
+checks: []
 
 decision:
   policy: owner
@@ -19,7 +22,7 @@ decision:
   ownerRole: reviewer
 
 git:
-  cleanupWorktrees: true
+  cleanupWorktrees: false
   preserveOnFailure: true
   allowPush: false
   allowMergeToBase: false

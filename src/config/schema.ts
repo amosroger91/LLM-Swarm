@@ -114,6 +114,7 @@ export const SwarmConfigSchema = z
     maxDiffChars: z.number().int().positive().default(50_000),
     logLevel: z.enum(["debug", "info", "warn", "error"]).default("info"),
     writeSnapshot: z.boolean().default(true),
+    requireChecks: z.boolean().default(true),
     gitAuthorName: z.string().min(1).default("LLM Swarm"),
     gitAuthorEmail: z.string().min(3).default("swarm@localhost"),
     decision: z
@@ -126,7 +127,7 @@ export const SwarmConfigSchema = z
       .default({ policy: "owner", quorum: 1, ownerRole: "reviewer" }),
     git: z
       .object({
-        cleanupWorktrees: z.boolean().default(true),
+        cleanupWorktrees: z.boolean().default(false),
         preserveOnFailure: z.boolean().default(true),
         allowPush: z.boolean().default(false),
         allowMergeToBase: z.boolean().default(false),
@@ -134,7 +135,7 @@ export const SwarmConfigSchema = z
       })
       .strict()
       .default({
-        cleanupWorktrees: true,
+        cleanupWorktrees: false,
         preserveOnFailure: true,
         allowPush: false,
         allowMergeToBase: false,

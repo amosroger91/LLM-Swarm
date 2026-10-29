@@ -68,6 +68,11 @@ describe("end to end", () => {
         worker: (request) => {
           const id = taskIdFromPrompt(request.prompt);
           if (!request.cwd) throw new Error("worker was not given a worktree");
+          if (id === "c") {
+            expect(fs.readFileSync(path.join(request.cwd, "a.txt"), "utf8")).toBe("a\n");
+            expect(fs.readFileSync(path.join(request.cwd, "b.txt"), "utf8")).toBe("b\n");
+            expect(request.prompt).toContain('FILE "a.txt"');
+          }
           fs.writeFileSync(path.join(request.cwd, `${id}.txt`), `${id}\n`, "utf8");
           return jsonResponse(doneResult(`wrote ${id}`));
         },
@@ -90,7 +95,7 @@ describe("end to end", () => {
     const snapshot = job.snapshotPath;
     expect(snapshot).toBeTruthy();
     expect(fs.readFileSync(String(snapshot), "utf8")).toContain("GENERATED FILE");
-    const integration = path.join(dataDir, "worktrees", job.id, "_integration");
+    const integration = path.join(repo, "workspaces", job.id, "integration");
     expect(fs.readFileSync(path.join(integration, "a.txt"), "utf8")).toBe("a\n");
     expect(fs.readFileSync(path.join(integration, "b.txt"), "utf8")).toBe("b\n");
     expect(fs.readFileSync(path.join(integration, "c.txt"), "utf8")).toBe("c\n");
@@ -161,7 +166,7 @@ describe("end to end", () => {
     const revision = store.listTasks(started.job_id).find((task) => task.kind === "revision");
     expect(revision?.stableId).toBe("revision-2");
     expect(revision?.status).toBe("done");
-    const integration = path.join(dataDir, "worktrees", started.job_id, "_integration");
+    const integration = path.join(repo, "workspaces", started.job_id, "integration");
     expect(fs.existsSync(path.join(integration, "revision-2.txt"))).toBe(true);
     expect(fs.readFileSync(path.join(integration, "a.txt"), "utf8")).toBe("a\n");
     expect(store.listReviews(started.job_id).map((review) => review.status)).toEqual([
@@ -171,7 +176,7 @@ describe("end to end", () => {
     store.close();
   });
 
-  it("records a merge conflict without overwriting either branch", async () => {
+  it("rejects worker changes outside assigned files before integration", async () => {
     const dir = tempDir("swarm-e2e-conflict-");
     dirs.push(dir);
     const repo = path.join(dir, "repo");
@@ -207,13 +212,18 @@ describe("end to end", () => {
     await orchestrator.waitFor(started.job_id);
     const job = store.mustJob(started.job_id);
     expect(job.status).toBe("failed");
-    expect(job.error ?? "").toContain("conflict");
+    expect(job.error ?? "").toContain("tasks failed");
+    expect(store.listTasks(job.id).every((task) => task.error?.includes("unowned file"))).toBe(
+      true,
+    );
     expect(reviews).toBe(0);
     expect(git(repo, ["show", "main:README.md"])).toBe("base\n");
     const worktrees = store.listWorktrees(job.id);
     expect(worktrees.length).toBeGreaterThanOrEqual(2);
     expect(worktrees.every((item) => item.cleanupState === "preserved")).toBe(true);
-    const contents = worktrees.map((item) => git(repo, ["show", `${item.branchName}:README.md`]));
+    const contents = worktrees.map((item) =>
+      fs.readFileSync(path.join(item.path, "README.md"), "utf8"),
+    );
     expect(contents).toContain("from-a\n");
     expect(contents).toContain("from-b\n");
     store.close();

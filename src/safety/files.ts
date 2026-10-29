@@ -7,10 +7,19 @@ export function validateFilePath(file: string): string {
   const normalized = file.replaceAll("\\", "/");
   const parts = normalized.split("/");
   if (
-    !normalized || path.posix.isAbsolute(normalized) || /[\x00-\x1f:"<>|?*]/.test(normalized) ||
-    parts.some((part) => !part || part === "." || part === ".." || /[. ]$/.test(part) ||
-      /^(?:\.git|\.swarm-data|workspaces)$/i.test(part) ||
-      /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part))
+    !normalized ||
+    path.posix.isAbsolute(normalized) ||
+    [...normalized].some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127) ||
+    /[:"<>|?*]/.test(normalized) ||
+    parts.some(
+      (part) =>
+        !part ||
+        part === "." ||
+        part === ".." ||
+        /[. ]$/.test(part) ||
+        /^(?:\.git|\.swarm-data|workspaces)$/i.test(part) ||
+        /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part),
+    )
   ) {
     throw new SwarmError(`Path is outside the worktree or reserved: ${file}`, "unsafe_path");
   }
@@ -42,7 +51,8 @@ export function safeFileTarget(root: string, file: string): string {
 
 function headerPath(raw: string): string | null {
   if (raw === "/dev/null") return null;
-  if (!/^[ab]\//.test(raw)) throw new SwarmError("Patch paths require a/ or b/ prefixes", "bad_patch", true);
+  if (!/^[ab]\//.test(raw))
+    throw new SwarmError("Patch paths require a/ or b/ prefixes", "bad_patch", true);
   return validateFilePath(raw.slice(2));
 }
 
@@ -51,8 +61,12 @@ export function validatedPatchPaths(patch: string): string[] {
   for (const section of patch.split(/(?=^diff --git )/m)) {
     if (!section.trim()) continue;
     const header = section.split(/^@@/m, 1)[0] ?? "";
-    if (/^(?:new file mode|old mode|new mode|deleted file mode) (?!100644\b|100755\b)/m.test(header) ||
-        /^(?:rename |copy |GIT binary patch|Binary files )/m.test(header)) {
+    if (
+      /^(?:new file mode|old mode|new mode|deleted file mode) (?!100644\b|100755\b)/m.test(
+        header,
+      ) ||
+      /^(?:rename |copy |GIT binary patch|Binary files )/m.test(header)
+    ) {
       throw new SwarmError("Only regular text-file patches are supported", "bad_patch", true);
     }
     const diff = /^diff --git a\/(\S+) b\/(\S+)\r?$/m.exec(header);
@@ -69,7 +83,8 @@ export function validatedPatchPaths(patch: string): string[] {
       if (!line.startsWith("+++ ") && !line.startsWith("--- ")) continue;
       const file = headerPath(line.slice(4));
       if (file) {
-        if (diff && file !== diff[2]) throw new SwarmError("Mismatched patch headers", "unsafe_path");
+        if (diff && file !== diff[2])
+          throw new SwarmError("Mismatched patch headers", "unsafe_path");
         paths.add(file);
       }
     }

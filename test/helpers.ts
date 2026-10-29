@@ -31,6 +31,7 @@ export function testConfig(dataDir: string, patch: Partial<SwarmConfig> = {}): S
     ...defaultConfig(),
     dataDir,
     writeSnapshot: false,
+    requireChecks: false,
     jobTimeoutMs: 20_000,
     providerTimeoutMs: 5_000,
     ...patch,

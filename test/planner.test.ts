@@ -29,6 +29,14 @@ const validTask = {
 };
 
 describe("validatePlan", () => {
+  it("rejects overlapping directory ownership between independent tasks", () => {
+    const plan = planValue([{ id: "a" }, { id: "b" }]);
+    plan.tasks[0]!.fileAreas = ["src"];
+    plan.tasks[1]!.fileAreas = ["src/feature.ts"];
+    expect(validatePlan(plan).ok).toBe(false);
+    plan.tasks[1]!.dependencies = ["a"];
+    expect(validatePlan(plan).ok).toBe(true);
+  });
   it("accepts a plan with unique ids and an acyclic graph", () => {
     const result = validatePlan({
       goal: "Add a command",
@@ -118,10 +126,7 @@ describe("validatePlan", () => {
     const result = validatePlan({
       goal: "Build the site",
       completionCriteria: ["the site greets a visitor"],
-      tasks: [
-        validTask,
-        { ...validTask, id: "beta", title: "Beta", fileAreas: ["src/alpha.ts"] },
-      ],
+      tasks: [validTask, { ...validTask, id: "beta", title: "Beta", fileAreas: ["src/alpha.ts"] }],
     });
     expect(result.ok).toBe(false);
     if (result.ok) return;

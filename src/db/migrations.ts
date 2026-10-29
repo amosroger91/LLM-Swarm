@@ -208,4 +208,17 @@ CREATE INDEX idx_worktrees_job ON worktrees(job_id);
 CREATE INDEX idx_artifacts_job ON artifacts(job_id);
 `,
   },
+  {
+    version: 2,
+    name: "scheduler_ownership_and_pinned_base",
+    sql: `
+ALTER TABLE jobs ADD COLUMN base_commit TEXT;
+CREATE TABLE scheduler_owner (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  token TEXT NOT NULL,
+  pid INTEGER NOT NULL,
+  hostname TEXT NOT NULL
+);
+`,
+  },
 ];

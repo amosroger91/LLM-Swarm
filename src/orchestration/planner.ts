@@ -137,12 +137,25 @@ export function validatePlan(
       }
     }
   }
+  const ancestors = (id: string, seen = new Set<string>()): Set<string> => {
+    for (const dependency of plan.tasks.find((task) => task.id === id)?.dependencies ?? []) {
+      if (seen.has(dependency)) continue;
+      seen.add(dependency);
+      ancestors(dependency, seen);
+    }
+    return seen;
+  };
   const fileOwners = new Map<string, string>();
   for (const task of plan.tasks) {
     for (const area of task.fileAreas) {
       const key = area.replaceAll("\\", "/").replace(/^\.\//, "").toLowerCase();
       if (!key) continue;
-      const owner = fileOwners.get(key);
+      const owner = [...fileOwners].find(
+        ([other, owner]) =>
+          (key === other || key.startsWith(`${other}/`) || other.startsWith(`${key}/`)) &&
+          !ancestors(task.id).has(owner) &&
+          !ancestors(owner).has(task.id),
+      )?.[1];
       if (owner) {
         errors.push(
           `tasks ${owner} and ${task.id} both list ${area}. Put shared files in one task so the branches do not conflict.`,

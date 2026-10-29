@@ -31,6 +31,33 @@ function workspace(): GitWorkspace {
 }
 
 describe("git workspace", () => {
+  it("does not execute repository or worktree-root hooks during coordinator commits", async () => {
+    const dir = tempDir("swarm-hooks-");
+    dirs.push(dir);
+    const repo = path.join(dir, "repo");
+    initRepo(repo);
+    const workspaceManager = workspace();
+    const context = await workspaceManager.assertRepo(repo);
+    const run = await workspaceManager.createRunWorkspace({
+      repoRoot: repo,
+      dataDir: dir,
+      jobId: "job-hooks",
+      stableId: "a",
+      attempt: 1,
+      baseCommit: context.baseCommit,
+    });
+    const hook = "#!/bin/sh\necho executed > hook-ran.txt\nexit 1\n";
+    fs.writeFileSync(path.join(repo, ".git/hooks/pre-commit"), hook, { mode: 0o755 });
+    fs.writeFileSync(path.join(run.path, "pre-commit"), hook, { mode: 0o755 });
+    fs.writeFileSync(path.join(run.path, "a.txt"), "done\n");
+    const committed = await workspaceManager.finalizeRun({
+      repoRoot: repo,
+      workspace: run,
+      message: "safe commit",
+    });
+    expect(committed.headCommit).toBeTruthy();
+    expect(fs.existsSync(path.join(run.path, "hook-ran.txt"))).toBe(false);
+  });
   it("creates an isolated worktree, commits with the swarm author, and refuses a remote push", async () => {
     const dir = tempDir("swarm-git-");
     dirs.push(dir);
@@ -48,7 +75,8 @@ describe("git workspace", () => {
       attempt: 1,
       baseCommit: context.baseCommit,
     });
-    expect(run.path.startsWith(data)).toBe(true);
+    expect(run.path).toBe(path.join(repo, "workspaces", "job-12345678-aaaa", "agent-alpha-1"));
+    expect(git(repo, ["status", "--porcelain"])).toBe("");
     expect(fs.existsSync(path.join(run.path, "README.md"))).toBe(true);
     const finalized = await gitWorkspace.finalizeRun({
       repoRoot: repo,
@@ -74,7 +102,7 @@ describe("git workspace", () => {
       gitWorkspace.createRunWorkspace({
         repoRoot: repo,
         dataDir: repo,
-        jobId: "job-12345678-aaaa",
+        jobId: "../invalid-job",
         stableId: "inside",
         attempt: 1,
         baseCommit: context.baseCommit,
@@ -209,7 +237,7 @@ describe("git workspace", () => {
         "+++ b/index.html",
         "@@ -1,1 +1,2 @@",
         "+<h1>Swarm Test Site</h1>",
-        "+<link rel=\"stylesheet\" href=\"site.css\">",
+        '+<link rel="stylesheet" href="site.css">',
         "",
       ].join("\n"),
     });
