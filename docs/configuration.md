@@ -41,7 +41,35 @@ Set `fileEditing: false` for a read-only CLI that returns patches from supplied 
 
 `capabilities` is `structuredOutput`, `toolCalling`, `streaming`, and `nonInteractive`. Workers with `structuredOutput: false` may return plain text, which is stored as a done result. Planners and reviewers always require JSON.
 
-There is no `apiKey` field. A config that contains one fails validation.
+`apiKeyEnv` normally names an environment variable. An ignored local YAML file may instead provide `apiKey: <credential>`. The loader places that value in the current process environment and retains only the variable reference in validated configuration, job profiles and SQLite. For compatibility it also recognizes OpenRouter/NVIDIA credentials pasted into `apiKeyEnv`; the value is never used as a variable name or saved in a job snapshot. Keep credential-bearing configuration out of version control.
+
+At CLI startup, the selected Ollama profile is checked against `/api/show`. If the selected model reports no tool support, workers use patch responses from that same model; the saved YAML and chosen model are unchanged. This avoids advertising tools to a completion-only base model. It does not turn a base model into an instruction-tuned model.
+
+### Automatic failover
+
+Planner conversations use compact task/blocker/check summaries with read-only tools for specific missing evidence. The dashboard accepts a message immediately, clears the composer, and polls its durable pending/completed/failed state. A failure appears in the conversation with retry; a service restart marks an unfinished reply failed instead of leaving it pending forever. Enter sends and Shift+Enter inserts a newline. `POST /api/jobs/:id/chat` accepts `background: true` for this queued behavior (HTTP 202); omitting it keeps the synchronous reply contract. Chat turns have a maximum 90-second deadline, shared by the configured fallback candidates. Provider quotas still apply.
+
+Set `costPolicy: local_or_free` to fail closed on cost: only non-CLI providers explicitly declared with `costClass: local` or `costClass: free` may run, including the primary. Metered and unclassified providers are skipped, and exhausting permitted routes creates a blocker. `configured` is the compatibility default. Cost classes are configuration declarations, not a vendor billing API; a `free` route must use an account on that provider's free tier. The framework never upgrades accounts or purchases quota.
+
+For quota-limited API providers, set `maxInputChars` to bound the serialized request (including system messages and tool definitions) before any network request is sent. This is a character limit, not a promise about model tokenization. Oversized requests raise a context blocker rather than consuming another attempt at the service. Under local/free policy, tool workers retain the assigned task instructions and fetch source in pages of at most 4,000 characters instead of resending the repository on every turn. The full immutable human request remains in SQLite and is accessible through the paginated `read_goal` tool; workers must consult it before product or scope decisions. Recent coordination excerpts are marked as excerpts and can be refreshed through tools. Required review evidence and checks are never weakened to fit a budget.
+
+An agent can list up to four ordered `fallbackProviders`. Each name references a provider definition, so another model on the same endpoint and a different provider use the same mechanism:
+
+```yaml
+agents:
+  local-worker:
+    role: worker
+    provider: local-qwen
+    fallbackProviders: [local-qwen-backup, groq-worker]
+```
+
+Only listed providers can be selected; there is no automatic discovery, upgrade, or CLI substitution. Choose backups whose API usage you authorize. Credential values stay outside saved profiles; provider definitions and credential references are snapshotted with each new job, including its backups. Existing jobs keep their snapshots.
+
+On timeouts, connection/API errors, missing credentials, tool-loop exhaustion, or invalid response contracts, the coordinator tries each candidate once within the existing turn deadline. Each gets a share of the remaining time, failed candidates cool down for one minute in the running scheduler, and compatible backups continue in the same scoped worktree after pending tool operations settle. A provider that cannot preserve required editing capabilities is skipped. Cancellation, containment failures, rejected reviews, and legitimate task blockers do not trigger a model switch. Completed prerequisites remain intact; the same checks and independent review still apply.
+
+Every switch and exhaustion is recorded in events and shared messages. The dashboard displays each role's primary and ordered backups; call evidence records the provider/model actually used. Exhausting the list surfaces a blocker through the existing recovery mechanism. A restart restores the saved candidates; the short health cooldown is process-local.
+
+OpenAI-compatible HTTP 429 responses with a short `Retry-After` (or a reported cooldown) receive at most two retries within the deadline before failover. Native Ollama accepts optional `thinking: false` to disable model thinking where supported, without changing its model. The default leaves the model's thinking setting alone.
 
 ### Sample CLI profiles
 

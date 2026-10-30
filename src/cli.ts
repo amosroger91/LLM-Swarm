@@ -16,6 +16,7 @@ import { renderSnapshot, writeSnapshotAtomic } from "./orchestration/snapshot.js
 import { createRedactor, secretValuesFromEnv } from "./safety/redact.js";
 import { SwarmError, errorMessage } from "./errors.js";
 import { startDashboard } from "./web/server.js";
+import { negotiateOllamaCapabilities } from "./providers/capabilities.js";
 
 interface ParsedArgs {
   command: string;
@@ -71,10 +72,22 @@ async function main(): Promise<void> {
     return;
   }
   const config = loadConfig(args.config);
+  const capabilityNotes = await negotiateOllamaCapabilities(config);
   const redact = createRedactor(
-    secretValuesFromEnv(["OLLAMA_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "GEMINI_API_KEY"]),
+    secretValuesFromEnv([
+      "OLLAMA_API_KEY",
+      "OPENAI_API_KEY",
+      "OPENROUTER_API_KEY",
+      "NVIDIA_API_KEY",
+      "XAI_API_KEY",
+      "GEMINI_API_KEY",
+      ...Object.values(config.providers).flatMap((provider) =>
+        provider.type === "openai_compatible" && provider.apiKeyEnv ? [provider.apiKeyEnv] : [],
+      ),
+    ]),
   );
   const logger = createLogger(config.logLevel, redact);
+  for (const note of capabilityNotes) logger.warn({}, note);
   const db = openDatabase(databasePath(config));
   const store = new Store(db);
   if (args.command === "migrate") {
@@ -161,10 +174,16 @@ async function main(): Promise<void> {
   });
   let orchestrator: Orchestrator;
   try {
-    orchestrator = new Orchestrator(store, config, workspace, configProviderResolver(redact), {
-      logger,
-      recoverOnStart: true,
-    });
+    orchestrator = new Orchestrator(
+      store,
+      config,
+      workspace,
+      configProviderResolver(redact, config.costPolicy),
+      {
+        logger,
+        recoverOnStart: true,
+      },
+    );
   } catch (error) {
     store.close();
     if (

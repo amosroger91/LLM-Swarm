@@ -15,6 +15,8 @@ export type ProviderCapabilities = z.infer<typeof CapabilitiesSchema>;
 const OpenAIProviderSchema = z
   .object({
     type: z.literal("openai_compatible"),
+    costClass: z.enum(["local", "free", "metered", "unknown"]).optional(),
+    maxInputChars: z.number().int().min(1000).max(1000000).optional(),
     baseUrl: z.string().url(),
     model: z.string().min(1),
     apiKeyEnv: z
@@ -28,6 +30,7 @@ const OpenAIProviderSchema = z
     maxToolRounds: z.number().int().min(1).max(100).optional(),
     maxOutputTokens: z.number().int().positive().max(100000).optional(),
     protocol: z.enum(["openai", "ollama"]).optional(),
+    thinking: z.boolean().optional(),
     contextTokens: z.number().int().min(2048).max(262144).optional(),
     capabilities: CapabilitiesSchema,
   })
@@ -36,6 +39,7 @@ const OpenAIProviderSchema = z
 const CliProviderSchema = z
   .object({
     type: z.literal("cli"),
+    costClass: z.enum(["local", "free", "metered", "unknown"]).optional(),
     command: z.string().min(1),
     fileEditing: z.boolean().optional(),
     args: z.array(z.string()).max(100),
@@ -58,6 +62,7 @@ const CliProviderSchema = z
 const CustomProviderSchema = z
   .object({
     type: z.literal("custom"),
+    costClass: z.enum(["local", "free", "metered", "unknown"]).optional(),
     driver: z.string().min(1).max(100),
     options: z.record(z.string(), z.unknown()).default({}),
     capabilities: CapabilitiesSchema,
@@ -80,6 +85,7 @@ const AgentSchema = z
   .object({
     role: z.enum(["planner", "worker", "reviewer"]),
     provider: z.string().min(1),
+    fallbackProviders: z.array(z.string().min(1)).max(4).optional(),
     systemPrompt: z.string().max(20_000).optional(),
   })
   .strict();
@@ -106,6 +112,7 @@ export const SwarmConfigSchema = z
     dataDir: z.string().min(1).default(".swarm-data"),
     database: z.string().min(1).optional(),
     defaultProfile: z.string().min(1).default("default"),
+    costPolicy: z.enum(["configured", "local_or_free"]).default("configured"),
     defaultWorkerCount: z.number().int().positive().default(2),
     maxWorkerCount: z.number().int().positive().default(5),
     allowWorkerCountAboveDefault: z.boolean().default(false),
@@ -188,6 +195,17 @@ export const SwarmConfigSchema = z
           path: ["agents", name, "provider"],
           message: `Unknown provider ${agent.provider}`,
         });
+      }
+      const seen = new Set([agent.provider]);
+      for (const fallback of agent.fallbackProviders ?? []) {
+        if (!config.providers[fallback] || seen.has(fallback)) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["agents", name, "fallbackProviders"],
+            message: `Unknown or repeated fallback provider ${fallback}`,
+          });
+        }
+        seen.add(fallback);
       }
     }
     for (const [name, profile] of Object.entries(config.profiles)) {

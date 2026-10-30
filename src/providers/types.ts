@@ -16,6 +16,9 @@ export interface ProviderRequest {
   metadata?: Record<string, string>;
   tools?: AgentTool[];
   maxPromptChars?: number;
+  totalTimeoutMs?: number;
+  validateResponse?: (response: ProviderResponse) => void;
+  onFailover?: (event: { from: string; to: string | null; reason: string }) => void;
   onCall?: (call: {
     provider: string;
     model?: string;

@@ -49,15 +49,18 @@ npx tsx src/cli.ts status <job_id> --config config/swarm.example.yaml
 
 ## Configuration
 
-Secrets are read from the environment. The database, config, and logs store the variable name, not the value.
+Secrets are read from the environment. An ignored local YAML file can also supply `apiKey`; the loader converts it to an environment reference before validation and persistence. Validated configuration snapshots and the database store the reference, and the CLI redacts configured credentials from logs and provider errors.
 
-| Variable         | Required | Description                                                           |
-| ---------------- | -------- | --------------------------------------------------------------------- |
-| `OLLAMA_API_KEY` | optional | Sent only when set. The sample Ollama provider works with no key.     |
-| `OPENAI_API_KEY` | optional | For an OpenAI-compatible provider that names this variable.           |
-| `XAI_API_KEY`    | optional | Passed to the grok CLI only when that profile's `envPass` lists it.   |
-| `GEMINI_API_KEY` | optional | Passed to the gemini CLI only when that profile's `envPass` lists it. |
-| `SWARM_CONFIG`   | optional | Path to a YAML config. `--config` wins over this variable.            |
+| Variable             | Required         | Description                                                           |
+| -------------------- | ---------------- | --------------------------------------------------------------------- |
+| `OLLAMA_API_KEY`     | optional         | Sent only when set. The sample Ollama provider works with no key.     |
+| `OPENAI_API_KEY`     | optional         | For an OpenAI-compatible provider that names this variable.           |
+| `OPENROUTER_API_KEY` | profile-specific | For an OpenRouter provider that names this variable.                  |
+| `NVIDIA_API_KEY`     | profile-specific | For an NVIDIA provider that names this variable.                      |
+| `GROQ_API_KEY`       | profile-specific | For a Groq provider that names this variable.                         |
+| `XAI_API_KEY`        | optional         | Passed to the grok CLI only when that profile's `envPass` lists it.   |
+| `GEMINI_API_KEY`     | optional         | Passed to the gemini CLI only when that profile's `envPass` lists it. |
+| `SWARM_CONFIG`       | optional         | Path to a YAML config. `--config` wins over this variable.            |
 
 `.env.example` lists supported variables. Set them in the process environment; the app does not automatically load `.env`. Node's `--env-file` option can load a local file when starting the built CLI. Provider and profile fields are documented in [docs/configuration.md](docs/configuration.md).
 
