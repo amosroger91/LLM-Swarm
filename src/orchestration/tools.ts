@@ -27,6 +27,7 @@ export function workspaceTools(input: {
   signal: AbortSignal;
 }): AgentTool[] {
   const { root, store, config, jobId, signal } = input;
+  const readLimit = config.costPolicy === "local_or_free" ? 4000 : 16000;
   const tool = (
     name: string,
     description: string,
@@ -99,7 +100,7 @@ export function workspaceTools(input: {
       z.object({
         path: z.string(),
         offset: z.number().int().nonnegative().default(0),
-        limit: z.number().int().min(1).max(16000).default(16000),
+        limit: z.number().int().min(1).max(readLimit).default(readLimit),
       }),
       async (args) => {
         const text = await read(args.path as string);
@@ -151,6 +152,27 @@ export function workspaceTools(input: {
       }),
     ),
   ];
+  if (config.costPolicy === "local_or_free")
+    tools.push(
+      tool(
+        "read_goal",
+        "Read the immutable human goal in pages before making product or scope decisions.",
+        z.object({
+          offset: z.number().int().nonnegative().default(0),
+          limit: z.number().int().min(1).max(4000).default(2000),
+        }),
+        async (args) => {
+          const goal = store.humanGoal(jobId),
+            offset = args.offset as number,
+            end = Math.min(goal.length, offset + (args.limit as number));
+          return {
+            content: goal.slice(offset, end),
+            totalCharacters: goal.length,
+            nextOffset: end < goal.length ? end : null,
+          };
+        },
+      ),
+    );
   if (input.readOnly) return tools;
   tools.push(
     tool(

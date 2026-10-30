@@ -31,7 +31,7 @@ Do not add `--always-approve` or `--yolo` to a shared profile.
 
 ## Ollama returns HTML or connection errors
 
-The default base URL is `http://127.0.0.1:11434/v1`. The adapter appends `/chat/completions`. No API key is required when `apiKeyOptional` is true. A key is never written to SQLite. If the server echoes a key, the redactor removes values of `OLLAMA_API_KEY`, `OPENAI_API_KEY`, `XAI_API_KEY`, and `GEMINI_API_KEY` from log lines and from provider errors in the CLI process.
+The default base URL is `http://127.0.0.1:11434/v1`. The adapter appends `/chat/completions`. No API key is required when `apiKeyOptional` is true. A key is never written to SQLite. If a server echoes a key, the CLI redacts values of `OLLAMA_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `NVIDIA_API_KEY`, `XAI_API_KEY`, and `GEMINI_API_KEY` from log lines and provider errors.
 
 ## Git commits show the wrong author
 

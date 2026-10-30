@@ -4,6 +4,7 @@ import { createRedactor } from "../safety/redact.js";
 import { extractJsonValue } from "./parse.js";
 import type { AgentProvider, ProviderRequest, ProviderResponse } from "./types.js";
 import { z } from "zod";
+import { setTimeout as delay } from "node:timers/promises";
 
 const CompletionSchema = z.object({
   model: z.string().optional(),
@@ -63,9 +64,15 @@ export class OpenAICompatibleProvider implements AgentProvider {
       { role: "user", content: request.prompt },
     ];
     const tools = this.capabilities.toolCalling ? (request.tools ?? []) : [];
+    let lastRead = "";
+    let repeatedReads = 0;
+    const promptLimit = Math.min(
+      request.maxPromptChars ?? 200000,
+      this.config.maxInputChars ?? Infinity,
+    );
     for (let round = 0; round <= (this.config.maxToolRounds ?? 16); round++) {
       request.signal?.throwIfAborted();
-      if (round > 0 && JSON.stringify(messages).length > (request.maxPromptChars ?? 200000)) {
+      if (round > 0 && JSON.stringify(messages).length > promptLimit * 0.75) {
         const before = JSON.stringify(messages).length;
         // Keep the full original system/user contract and the newest tool result.
         // Only older, re-readable tool evidence is compacted, explicitly.
@@ -85,7 +92,7 @@ export class OpenAICompatibleProvider implements AgentProvider {
         }
         const after = JSON.stringify(messages).length;
         request.onContextCompacted?.(before, after);
-        if (after > (request.maxPromptChars ?? 200000))
+        if (after > promptLimit)
           throw new SwarmError(
             "Tool context still exceeds its limit after bounded compaction; split the task",
             "context_limit",
@@ -154,6 +161,24 @@ export class OpenAICompatibleProvider implements AgentProvider {
           result = { error: this.redact(errorMessage(error)) };
         }
         const serialized = JSON.stringify(result);
+        const readOnly = [
+          "read_file",
+          "list_files",
+          "search_source",
+          "read_coordination",
+          "read_goal",
+        ].includes(call.function.name);
+        const signature = readOnly
+          ? JSON.stringify([call.function.name, call.function.arguments, serialized])
+          : "";
+        repeatedReads = signature && signature === lastRead ? repeatedReads + 1 : 1;
+        lastRead = signature;
+        if (readOnly && repeatedReads >= 3)
+          throw new SwarmError(
+            `Agent repeated ${call.function.name} three times with unchanged evidence`,
+            "tool_loop",
+            true,
+          );
         messages.push({
           role: "tool",
           tool_call_id: call.id,
@@ -177,6 +202,7 @@ export class OpenAICompatibleProvider implements AgentProvider {
     request: ProviderRequest,
     messages: Array<Record<string, unknown>>,
     useTools: boolean,
+    rateLimitRetries = 0,
   ): Promise<ProviderResponse> {
     const timeoutMs = request.timeoutMs ?? this.config.timeoutMs;
     const key = this.readKey();
@@ -196,6 +222,7 @@ export class OpenAICompatibleProvider implements AgentProvider {
     const nativeOllama = this.config.protocol === "ollama";
     if (nativeOllama) {
       body.stream = false;
+      if (this.config.thinking !== undefined) body.think = this.config.thinking;
       body.think = false;
       body.options = {
         num_ctx: this.config.contextTokens ?? 16384,
@@ -234,8 +261,15 @@ export class OpenAICompatibleProvider implements AgentProvider {
       body.response_format = { type: "json_object" };
     }
     if (nativeOllama) delete body.response_format;
+    if (this.config.maxInputChars && JSON.stringify(body).length > this.config.maxInputChars)
+      throw new SwarmError(
+        `Request exceeds ${this.config.maxInputChars}-character provider input budget. Split the assignment or read smaller source excerpts; no request was sent.`,
+        "context_limit",
+        true,
+      );
     const timeout = AbortSignal.timeout(timeoutMs);
     const signal = request.signal ? AbortSignal.any([request.signal, timeout]) : timeout;
+    const requestStarted = Date.now();
     let response: Response;
     try {
       response = await fetch(
@@ -268,6 +302,39 @@ export class OpenAICompatibleProvider implements AgentProvider {
     }
     const raw = await response.text();
     const redacted = this.redact(raw.slice(0, 4000));
+    if (response.status === 429 && rateLimitRetries < 2) {
+      const retryAfter = response.headers.get("retry-after");
+      const seconds = retryAfter === null ? NaN : Number(retryAfter);
+      const fromDate = retryAfter ? Date.parse(retryAfter) - Date.now() : NaN;
+      const fromMessage = /try again in\s+([\d.]+)s/i.exec(raw)?.[1];
+      const waitMs = Number.isFinite(seconds)
+        ? seconds * 1000
+        : Number.isFinite(fromDate)
+          ? fromDate
+          : fromMessage
+            ? Number(fromMessage) * 1000
+            : NaN;
+      if (
+        Number.isFinite(waitMs) &&
+        waitMs >= 0 &&
+        waitMs <= (request.maxRateLimitWaitMs ?? 60000) &&
+        waitMs + 50 < timeoutMs
+      ) {
+        request.onCall?.({
+          provider: this.name,
+          model: this.model,
+          durationMs: Date.now() - requestStarted,
+          error: `HTTP 429; waiting ${Math.ceil(waitMs)}ms before bounded retry`,
+        });
+        await delay(waitMs + 50, undefined, { signal });
+        return this.requestCompletion(
+          { ...request, signal },
+          messages,
+          useTools,
+          rateLimitRetries + 1,
+        );
+      }
+    }
     if (!response.ok) {
       throw new SwarmError(
         `OpenAI-compatible provider returned HTTP ${response.status}: ${redacted}`,

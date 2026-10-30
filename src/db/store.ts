@@ -69,6 +69,16 @@ export interface JobRecord {
   completedAt: string | null;
 }
 
+export interface PlannerChatRecord {
+  id: string;
+  jobId: string;
+  message: string;
+  status: "pending" | "completed" | "failed";
+  error: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+}
+
 export interface AgentProfileRecord {
   id: string;
   jobId: string;
@@ -78,8 +88,7 @@ export interface AgentProfileRecord {
   providerName: string;
   model: string | null;
   config: ProviderConfig;
-  /** Snapshotted failover chain, tried after the primary provider. */
-  fallbacks: Array<{ name: string; config: ProviderConfig }>;
+  fallbacks: Array<{ providerName: string; config: ProviderConfig }>;
   capabilitiesJson: string;
   systemPrompt: string | null;
   createdAt: string;
@@ -584,7 +593,7 @@ export class Store {
       role: "planner" | "worker" | "reviewer";
       providerName: string;
       config: ProviderConfig;
-      fallbacks?: Array<{ name: string; config: ProviderConfig }>;
+      fallbacks?: Array<{ providerName: string; config: ProviderConfig }>;
       systemPrompt?: string;
     }>,
   ): void {
@@ -629,17 +638,14 @@ export class Store {
           provider_name: string;
           model: string | null;
           config_json: string;
+          fallbacks_json: string;
           capabilities_json: string;
           system_prompt: string | null;
           created_at: string;
-          fallbacks_json: string;
         }
       | undefined;
     if (!row) throw new SwarmError(`Job ${jobId} has no ${role} profile`, "not_found");
     const config = ProviderConfigSchema.parse(JSON.parse(row.config_json) as unknown);
-    const fallbacks = z
-      .array(z.object({ name: z.string(), config: ProviderConfigSchema }))
-      .parse(JSON.parse(row.fallbacks_json || "[]") as unknown);
     return {
       id: row.id,
       jobId: row.job_id,
@@ -649,7 +655,9 @@ export class Store {
       providerName: row.provider_name,
       model: row.model,
       config,
-      fallbacks,
+      fallbacks: z
+        .array(z.object({ providerName: z.string(), config: ProviderConfigSchema }))
+        .parse(JSON.parse(row.fallbacks_json)),
       capabilitiesJson: row.capabilities_json,
       systemPrompt: row.system_prompt,
       createdAt: row.created_at,
@@ -1148,6 +1156,15 @@ export class Store {
   recoverInterrupted(): { jobs: number; runs: number; tasks: number } {
     return this.immediate(() => {
       const now = this.now();
+      const chats = this.db
+        .prepare("SELECT id FROM planner_chats WHERE status='pending'")
+        .all() as Array<{ id: string }>;
+      for (const chat of chats)
+        this.finishPlannerChat(
+          chat.id,
+          "failed",
+          "The service restarted before the planner replied. Your message is saved; you can retry it.",
+        );
       const runs = this.db
         .prepare("SELECT id, job_id FROM agent_runs WHERE status IN ('queued', 'running')")
         .all() as Array<{ id: string; job_id: string }>;
@@ -1237,6 +1254,89 @@ export class Store {
       });
     });
     return this.mustMessage(id);
+  }
+
+  beginPlannerChat(jobId: string, message: string, maxChars: number): PlannerChatRecord {
+    return this.immediate(() => {
+      this.mustJob(jobId);
+      if (
+        this.db
+          .prepare("SELECT 1 FROM planner_chats WHERE job_id=? AND status='pending'")
+          .get(jobId)
+      )
+        throw new SwarmError(
+          "The planner is already considering a message for this mission",
+          "chat_busy",
+        );
+      const id = randomUUID(),
+        now = this.now();
+      this.db
+        .prepare(
+          "INSERT INTO planner_chats(id,job_id,message,status,started_at) VALUES(?,?,?,'pending',?)",
+        )
+        .run(id, jobId, message, now);
+      this.postMessage({
+        jobId,
+        sender: "mcp-client",
+        role: "caller",
+        channel: "planning",
+        messageType: "chat",
+        content: message,
+        maxChars,
+      });
+      this.addEvent(jobId, "planner.chat_started", "planner_chat", id, {});
+      return {
+        id,
+        jobId,
+        message,
+        status: "pending",
+        error: null,
+        startedAt: now,
+        finishedAt: null,
+      };
+    });
+  }
+
+  latestPlannerChat(jobId: string): PlannerChatRecord | null {
+    return (
+      (this.db
+        .prepare(
+          "SELECT id,job_id AS jobId,message,status,error,started_at AS startedAt,finished_at AS finishedAt FROM planner_chats WHERE job_id=? ORDER BY rowid DESC LIMIT 1",
+        )
+        .get(jobId) as PlannerChatRecord | undefined) ?? null
+    );
+  }
+
+  finishPlannerChat(id: string, status: "completed" | "failed", error?: string): void {
+    this.immediate(() => {
+      const row = this.db
+        .prepare("SELECT job_id FROM planner_chats WHERE id=? AND status='pending'")
+        .get(id) as { job_id: string } | undefined;
+      if (!row) return;
+      this.db
+        .prepare("UPDATE planner_chats SET status=?,error=?,finished_at=? WHERE id=?")
+        .run(status, error ?? null, this.now(), id);
+      this.addEvent(row.job_id, `planner.chat_${status}`, "planner_chat", id, { error });
+      if (status === "failed")
+        this.postMessage({
+          jobId: row.job_id,
+          sender: "coordinator",
+          role: "system",
+          channel: "planning",
+          messageType: "finding",
+          content: `The planner could not answer this message. ${error ?? "The provider failed."}\nYour message is saved. You can retry when the planner is available.`,
+          maxChars: 2400,
+        });
+    });
+  }
+
+  planningMessages(jobId: string, limit = 50): MessageRecord[] {
+    const rows = this.db
+      .prepare(
+        "SELECT id FROM messages WHERE job_id=? AND channel='planning' ORDER BY created_at DESC,rowid DESC LIMIT ?",
+      )
+      .all(jobId, limit) as Array<{ id: string }>;
+    return rows.reverse().map((row) => this.mustMessage(row.id));
   }
 
   listMessages(jobId: string, limit = 100): MessageRecord[] {

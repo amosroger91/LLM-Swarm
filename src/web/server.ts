@@ -24,7 +24,6 @@ export async function startDashboard(
     ["/style.css", { file: "style.css", type: "text/css; charset=utf-8" }],
   ]);
   let origin = "";
-  const chats = new Set<string>();
   const json = (response: http.ServerResponse, status: number, data: unknown): void => {
     response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
     response.end(JSON.stringify(data));
@@ -53,6 +52,8 @@ export async function startDashboard(
     artifacts: store.listArtifacts(id),
     worktrees: store.listWorktrees(id),
     proposals: store.proposals(id),
+    plannerChat: store.latestPlannerChat(id),
+    planningMessages: store.planningMessages(id),
   });
   const server = http.createServer((request, response) => {
     void (async () => {
@@ -188,19 +189,14 @@ export async function startDashboard(
           json(response, 202, await orchestrator.resume(id));
           return;
         case "chat": {
-          if (chats.has(id)) {
-            json(response, 409, {
-              error: "The planner is already considering a message for this job",
-            });
-            return;
-          }
-          const { message } = z.object({ message: z.string().min(1).max(16000) }).parse(input);
-          chats.add(id);
-          try {
-            json(response, 200, await orchestrator.plannerChat(id, message));
-          } finally {
-            chats.delete(id);
-          }
+          const { message, background } = z
+            .object({
+              message: z.string().trim().min(1).max(16000),
+              background: z.boolean().default(false),
+            })
+            .parse(input);
+          if (background) json(response, 202, orchestrator.queuePlannerChat(id, message));
+          else json(response, 200, await orchestrator.plannerChat(id, message));
           return;
         }
         case "apply": {
@@ -224,7 +220,7 @@ export async function startDashboard(
       }
     })().catch((error) => {
       if (!response.headersSent)
-        json(response, 400, {
+        json(response, error instanceof SwarmError && error.code === "chat_busy" ? 409 : 400, {
           error: errorMessage(error),
           ...(error instanceof SwarmError ? { code: error.code } : {}),
         });

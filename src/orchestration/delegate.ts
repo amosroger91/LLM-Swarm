@@ -4,7 +4,7 @@ import type { SwarmConfig } from "../config/schema.js";
 import type { Store } from "../db/store.js";
 import { SwarmError, errorMessage } from "../errors.js";
 import { extractJsonValue } from "../providers/parse.js";
-import type { AgentProvider, ProviderResponse } from "../providers/types.js";
+import type { AgentProvider } from "../providers/types.js";
 
 export interface DelegateInput {
   task: string;
@@ -32,8 +32,15 @@ export interface DelegateResult {
   inputTokens?: number;
   outputTokens?: number;
   durationMs: number;
-  failover?: ProviderResponse["failover"];
+  /** Providers that failed or were skipped before one answered. */
+  failover?: FailoverStep[];
   truncated: boolean;
+}
+
+export interface FailoverStep {
+  provider: string;
+  kind: "failed" | "skipped";
+  error: string;
 }
 
 export interface DelegateDeps {
@@ -154,7 +161,9 @@ async function runOne(
   const provider = deps.providerFor(agentName);
   const prompt = `${context ? `${context}\n\n` : ""}TASK:\n${task}${format === "json" ? "\n\nReturn ONLY a JSON value." : ""}`;
   const started = Date.now();
-  const timeout = deps.config.providerTimeoutMs * (provider.maxAttempts ?? 1);
+  // The failover chain splits this budget across its providers.
+  const timeout = deps.config.providerTimeoutMs * (1 + (agent.fallbackProviders?.length ?? 0));
+  const steps: FailoverStep[] = [];
   const signal = deps.signal
     ? AbortSignal.any([deps.signal, AbortSignal.timeout(timeout)])
     : AbortSignal.timeout(timeout);
@@ -169,6 +178,16 @@ async function runOne(
       prompt,
       signal,
       timeoutMs: deps.config.providerTimeoutMs,
+      totalTimeoutMs: timeout,
+      onFailover: (event) => {
+        // A switch names the provider that failed; a null target means one was skipped.
+        if (steps.every((step) => step.provider !== event.from))
+          steps.push({
+            provider: event.from,
+            kind: event.to ? "failed" : "skipped",
+            error: event.reason.slice(0, 300),
+          });
+      },
       expectJson: format === "json" && provider.capabilities.structuredOutput,
       metadata: { role: "delegate" },
       maxPromptChars: deps.config.delegate.maxInputChars + 10_000,
@@ -185,7 +204,7 @@ async function runOne(
       inputTokens: response.usage?.inputTokens,
       outputTokens: response.usage?.outputTokens,
       durationMs: Date.now() - started,
-      failover: response.failover,
+      failover: steps.length ? steps : undefined,
       truncated: clipped.truncated,
     };
     deps.store.recordDelegation({
@@ -196,7 +215,7 @@ async function runOne(
       inputTokens: response.usage?.inputTokens ?? null,
       outputTokens: response.usage?.outputTokens ?? null,
       durationMs: result.durationMs,
-      failover: response.failover ?? [],
+      failover: steps,
       error: null,
     });
     return result;
@@ -209,7 +228,7 @@ async function runOne(
       inputTokens: null,
       outputTokens: null,
       durationMs: Date.now() - started,
-      failover: [],
+      failover: steps,
       error: errorMessage(error).slice(0, 2000),
     });
     throw error;

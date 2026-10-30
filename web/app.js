@@ -36,6 +36,8 @@ let state,
   refreshing = false,
   chatting = false;
 let toastTimer;
+const submittingChats = new Set();
+const acceptedChats = new Map();
 async function api(url, input, renew = true) {
   const response = await fetch(url, {
     headers: { "x-swarm-token": token, ...(input ? { "content-type": "application/json" } : {}) },
@@ -189,6 +191,17 @@ function renderMission() {
   $("#mission .stats article:last-child div>span").textContent = "Tokens reported";
   $("#mission .stats article:last-child p").textContent =
     `${metrics.callsWithUsage}/${metrics.providerCalls} calls with usage · ${metrics.retries} retries`;
+  if (status.provider_routes?.length) {
+    $("#mission .progress-section").insertAdjacentHTML(
+      "beforebegin",
+      `<section class="panel provider-routes"><div class="section-title"><h2>Models & automatic failover</h2><span>Backups tried in order · every switch recorded in Activity</span></div><div class="provider-route-grid">${status.provider_routes
+        .map((route) => {
+          const last = metrics.calls.filter((call) => call.role === route.role).at(-1);
+          return `<article><h3>${escape(route.role)}</h3><strong>${escape(route.primary.provider)} · ${escape(route.primary.model ?? "CLI")}</strong><p class="muted">${route.fallbacks.length ? `Backups: ${route.fallbacks.map((item) => `${escape(item.provider)} (${escape(item.model ?? "CLI")})`).join(" → ")}` : "No automatic backups configured"}</p><small>${last ? `Last reported call: ${escape(last.provider)} · ${escape(last.model ?? "CLI")}${last.error ? " · failed" : ""}` : "No completed model calls yet"}</small></article>`;
+        })
+        .join("")}</div></section>`,
+    );
+  }
   if (job.dryRun && job.status === "completed") {
     $("#mission .mission-actions").innerHTML =
       '<button class="primary" data-action="launch">Launch this plan →</button>';
@@ -239,12 +252,27 @@ function renderModels() {
 let chatSignature = "";
 function renderChat() {
   if (!detail) return;
-  const messages = detail.messages.filter(
-    (message) =>
-      message.channel === "planning" ||
-      (message.role === "planner" && message.messageType !== "proposal"),
-  );
-  const signature = selected + JSON.stringify([messages, detail.proposals]);
+  const messages =
+    detail.planningMessages ??
+    detail.messages.filter(
+      (message) =>
+        message.channel === "planning" ||
+        (message.role === "planner" && message.messageType !== "proposal"),
+    );
+  if (acceptedChats.get(selected) === detail.plannerChat?.id) acceptedChats.delete(selected);
+  chatting =
+    submittingChats.has(selected) ||
+    acceptedChats.has(selected) ||
+    detail.plannerChat?.status === "pending";
+  $("#send-message").disabled = chatting;
+  const pending = $("#planner-pending");
+  if (pending) {
+    pending.hidden = !chatting;
+    pending.textContent = chatting
+      ? `Planner is working… Your message is saved.${detail.plannerChat?.status === "pending" ? ` ${Math.max(0, Math.floor((Date.now() - Date.parse(detail.plannerChat.startedAt)) / 1000))}s` : ""}`
+      : "";
+  }
+  const signature = selected + JSON.stringify([messages, detail.proposals, detail.plannerChat]);
   if (signature === chatSignature) return;
   chatSignature = signature;
   const nearBottom =
@@ -256,7 +284,7 @@ function renderChat() {
     messages
       .map(
         (message) =>
-          `<article class="chat-bubble ${message.role === "caller" ? "human" : "agent"}"><div class="chat-label">${message.role === "caller" ? "YOU" : escape(message.sender)}<time>${date(message.createdAt)}</time></div><p>${escape(message.content)}</p></article>`,
+          `<article class="chat-bubble ${message.role === "caller" ? "human" : message.role === "system" ? "chat-error" : "agent"}"><div class="chat-label">${message.role === "caller" ? "YOU" : escape(message.sender)}<time>${date(message.createdAt)}</time></div><p>${escape(message.content)}</p></article>`,
       )
       .join("") +
       detail.proposals
@@ -264,7 +292,10 @@ function renderChat() {
           (proposal) =>
             `<article class="proposal"><div class="proposal-heading">▤ <strong>${proposal.tasks.length} proposed tasks</strong><span>${escape(proposal.status)}</span></div>${proposal.tasks.map((task) => `<div class="proposed-task"><strong>${escape(task.title)}</strong><span>${escape(task.fileAreas.join(", "))}</span></div>`).join("")}${proposal.status === "pending" ? `<button class="primary" data-proposal="${escape(proposal.id)}" ${detail.job.status === "planning" ? "disabled" : ""}>Add tasks to mission →</button>` : '<p class="muted">✓ Tasks handed to the execution queue</p>'}</article>`,
         )
-        .join("") ||
+        .join("") +
+      (detail.plannerChat?.status === "failed"
+        ? '<button type="button" class="quiet-button" data-retry-chat>Retry last message</button>'
+        : "") ||
     '<div class="chat-empty"><span>✧</span><h3>A good place to think.</h3><p>Ask about this mission, describe a change, or work through what’s blocking progress.</p></div>';
   if (nearBottom || chatting) $("#chat-messages").scrollTop = $("#chat-messages").scrollHeight;
 }
@@ -325,6 +356,16 @@ document.addEventListener("click", async (event) => {
   if (!button) return;
   if (button.classList.contains("close-dialog")) button.closest("dialog").close();
   if (button.dataset.job) choose(button.dataset.job);
+  if (button.hasAttribute("data-retry-chat") && detail?.plannerChat?.status === "failed") {
+    if ($("#planner-message").value.trim()) {
+      toast("Send or clear your current draft before retrying.");
+      $("#planner-message").focus();
+      return;
+    }
+    $("#planner-message").value = detail.plannerChat.message;
+    $("#planner-message").focus();
+    $("#planner-form").requestSubmit();
+  }
   if (button.dataset.tab) {
     tab = button.dataset.tab;
     renderMission();
@@ -385,20 +426,35 @@ $("#planner-form").addEventListener("submit", async (event) => {
   }
   const message = $("#planner-message").value.trim();
   if (!message) return;
+  const chatJob = selected;
+  submittingChats.add(chatJob);
   chatting = true;
   $("#send-message").disabled = true;
-  $("#planner-pending").hidden = false;
+  if ($("#planner-pending")) {
+    $("#planner-pending").hidden = false;
+    $("#planner-pending").textContent = "Sending your message…";
+  }
   $("#planner-message").value = "";
   try {
-    await api(jobUrl("chat"), { message });
+    const accepted = await api(`/api/jobs/${encodeURIComponent(chatJob)}/chat`, {
+      message,
+      background: true,
+    });
+    acceptedChats.set(chatJob, accepted.requestId);
+    submittingChats.delete(chatJob);
     await refresh();
   } catch (error) {
     toast(error.message);
-    $("#planner-message").value = message;
+    if (selected === chatJob && !$("#planner-message").value) $("#planner-message").value = message;
   } finally {
-    chatting = false;
-    $("#send-message").disabled = false;
-    $("#planner-pending").hidden = true;
+    submittingChats.delete(chatJob);
+    renderChat();
+  }
+});
+$("#planner-message").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    $("#planner-form").requestSubmit();
   }
 });
 $("#new-form").addEventListener("submit", async (event) => {

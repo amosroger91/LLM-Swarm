@@ -85,7 +85,7 @@
                 </p>
               </div>
             </div>
-            <div id="planner-pending" hidden>
+            <div id="planner-pending" role="status" aria-live="polite" hidden>
               <span class="thinking-dot"></span> Planner is considering your message…
             </div>
             <form id="planner-form">
@@ -98,7 +98,7 @@
                 required
               ></textarea>
               <div class="composer-footer">
-                <span>Guidance becomes shared context</span
+                <span>Enter to send · Shift+Enter for a new line</span
                 ><button
                   class="send-button"
                   type="submit"

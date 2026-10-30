@@ -16,6 +16,11 @@ export interface ProviderRequest {
   metadata?: Record<string, string>;
   tools?: AgentTool[];
   maxPromptChars?: number;
+  totalTimeoutMs?: number;
+  /** Longest Retry-After a provider should sleep through instead of failing. */
+  maxRateLimitWaitMs?: number;
+  validateResponse?: (response: ProviderResponse) => void;
+  onFailover?: (event: { from: string; to: string | null; reason: string }) => void;
   onCall?: (call: {
     provider: string;
     model?: string;
@@ -45,15 +50,11 @@ export interface ProviderResponse {
     type: "function";
     function: { name: string; arguments: string };
   }>;
-  /** Providers that failed before this response was produced by a fallback. */
-  failover?: Array<{ provider: string; kind: string; error: string }>;
 }
 
 export interface AgentProvider {
   readonly name: string;
   readonly model?: string;
   readonly capabilities: ProviderCapabilities;
-  /** Sequential provider attempts complete() may make; deadlines scale by this. */
-  readonly maxAttempts?: number;
   complete(request: ProviderRequest): Promise<ProviderResponse>;
 }

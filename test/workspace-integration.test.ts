@@ -53,7 +53,10 @@ describe("nested agent integration", () => {
   it("applies a read-only CLI worker's patch without requiring direct filesystem edits", async () => {
     const { repo, store, orchestrator } = fixture(
       {
-        planner: () => jsonResponse(planValue([{ id: "a" }])),
+        planner: (request) => {
+          expect(request.tools).toEqual([]);
+          return jsonResponse(planValue([{ id: "a" }]));
+        },
         worker: (request) => {
           expect(request.system).toContain("You have no shell and no editor");
           expect(request.prompt).toContain("patch field as a unified diff");

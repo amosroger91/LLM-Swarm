@@ -15,6 +15,8 @@ export type ProviderCapabilities = z.infer<typeof CapabilitiesSchema>;
 const OpenAIProviderSchema = z
   .object({
     type: z.literal("openai_compatible"),
+    costClass: z.enum(["local", "free", "metered", "unknown"]).optional(),
+    maxInputChars: z.number().int().min(1000).max(1000000).optional(),
     baseUrl: z.string().url(),
     model: z.string().min(1),
     apiKeyEnv: z
@@ -28,6 +30,7 @@ const OpenAIProviderSchema = z
     maxToolRounds: z.number().int().min(1).max(100).optional(),
     maxOutputTokens: z.number().int().positive().max(100000).optional(),
     protocol: z.enum(["openai", "ollama"]).optional(),
+    thinking: z.boolean().optional(),
     contextTokens: z.number().int().min(2048).max(262144).optional(),
     capabilities: CapabilitiesSchema,
   })
@@ -36,6 +39,7 @@ const OpenAIProviderSchema = z
 const CliProviderSchema = z
   .object({
     type: z.literal("cli"),
+    costClass: z.enum(["local", "free", "metered", "unknown"]).optional(),
     command: z.string().min(1),
     model: z.string().min(1).max(200).optional(),
     fileEditing: z.boolean().optional(),
@@ -67,6 +71,7 @@ const CliProviderSchema = z
 const CustomProviderSchema = z
   .object({
     type: z.literal("custom"),
+    costClass: z.enum(["local", "free", "metered", "unknown"]).optional(),
     driver: z.string().min(1).max(100),
     options: z.record(z.string(), z.unknown()).default({}),
     capabilities: CapabilitiesSchema,
@@ -89,8 +94,7 @@ const AgentSchema = z
   .object({
     role: z.enum(["planner", "worker", "reviewer"]),
     provider: z.string().min(1),
-    /** Providers tried in order when the primary is rate limited, down, or produces bad output. */
-    fallbacks: z.array(z.string().min(1)).max(10).default([]),
+    fallbackProviders: z.array(z.string().min(1)).max(4).optional(),
     systemPrompt: z.string().max(20_000).optional(),
   })
   .strict();
@@ -117,6 +121,7 @@ export const SwarmConfigSchema = z
     dataDir: z.string().min(1).default(".swarm-data"),
     database: z.string().min(1).optional(),
     defaultProfile: z.string().min(1).default("default"),
+    costPolicy: z.enum(["configured", "local_or_free"]).default("configured"),
     defaultWorkerCount: z.number().int().positive().default(2),
     maxWorkerCount: z.number().int().positive().default(5),
     allowWorkerCountAboveDefault: z.boolean().default(false),
@@ -212,44 +217,23 @@ export const SwarmConfigSchema = z
       });
     }
     for (const [name, agent] of Object.entries(config.agents)) {
-      const primary = config.providers[agent.provider];
-      if (!primary) {
+      if (!config.providers[agent.provider]) {
         ctx.addIssue({
           code: "custom",
           path: ["agents", name, "provider"],
           message: `Unknown provider ${agent.provider}`,
         });
       }
-      for (const [index, fallback] of agent.fallbacks.entries()) {
-        const candidate = config.providers[fallback];
-        if (!candidate) {
+      const seen = new Set([agent.provider]);
+      for (const fallback of agent.fallbackProviders ?? []) {
+        if (!config.providers[fallback] || seen.has(fallback)) {
           ctx.addIssue({
             code: "custom",
-            path: ["agents", name, "fallbacks", index],
-            message: `Unknown provider ${fallback}`,
-          });
-          continue;
-        }
-        if (fallback === agent.provider || agent.fallbacks.indexOf(fallback) !== index) {
-          ctx.addIssue({
-            code: "custom",
-            path: ["agents", name, "fallbacks", index],
-            message: `Provider ${fallback} appears twice in the chain`,
+            path: ["agents", name, "fallbackProviders"],
+            message: `Unknown or repeated fallback provider ${fallback}`,
           });
         }
-        // Planners and reviewers use one prompt contract for every provider. Workers get a
-        // prompt shaped by how they edit files, so a fallback must edit files the same way.
-        if (
-          primary &&
-          agent.role === "worker" &&
-          workerContract(primary) !== workerContract(candidate)
-        ) {
-          ctx.addIssue({
-            code: "custom",
-            path: ["agents", name, "fallbacks", index],
-            message: `Worker fallback ${fallback} (${workerContract(candidate)}) does not match ${agent.provider} (${workerContract(primary)}). Use providers with the same type, toolCalling, structuredOutput, and fileEditing.`,
-          });
-        }
+        seen.add(fallback);
       }
     }
     if (config.delegate.agent && !config.agents[config.delegate.agent]) {
@@ -301,19 +285,6 @@ export type SwarmConfig = z.infer<typeof SwarmConfigSchema>;
 export type AgentConfig = z.infer<typeof AgentSchema>;
 export type ProfileConfig = z.infer<typeof ProfileSchema>;
 export type CheckConfig = z.infer<typeof CheckSchema>;
-
-/** How a worker on this provider receives and returns work. Fallbacks must match. */
-export function workerContract(provider: ProviderConfig): string {
-  const edits =
-    provider.type === "cli"
-      ? provider.fileEditing !== false
-        ? "edits-checkout"
-        : "returns-patch"
-      : provider.capabilities.toolCalling
-        ? "edits-with-tools"
-        : "returns-patch";
-  return `${edits}/${provider.capabilities.structuredOutput ? "json" : "text"}`;
-}
 
 export function workerCap(config: SwarmConfig): number {
   return config.allowWorkerCountAboveDefault

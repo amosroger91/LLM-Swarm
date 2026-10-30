@@ -662,7 +662,7 @@ progress::-moz-progress-bar {
   padding: 12px 15px 18px;
 }
 #planner-pending {
-  font-size: 9px;
+  font-size: 12px;
   color: #a88cd0;
   padding: 10px 20px;
   display: flex;
@@ -2277,4 +2277,31 @@ input[type="checkbox"] {
     transition: none !important;
     scroll-behavior: auto !important;
   }
+}
+.provider-routes {
+  margin: 0 0 20px;
+}
+.provider-route-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+  gap: 18px;
+}
+.provider-route-grid article {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.provider-route-grid h3 {
+  text-transform: capitalize;
+  margin-bottom: 8px;
+}
+.provider-route-grid p {
+  line-height: 1.5;
+  font-size: 12px;
+}
+.provider-route-grid small {
+  font-size: 12px;
+}
+.chat-bubble.chat-error {
+  border-color: #a7613f;
+  background: #30241f;
 }

@@ -29,6 +29,7 @@ import {
 import type { Toolset } from "./mcp/server.js";
 import type { SwarmConfig } from "./config/schema.js";
 import { createProvider } from "./providers/registry.js";
+import { negotiateOllamaCapabilities } from "./providers/capabilities.js";
 
 interface ParsedArgs {
   command: string;
@@ -78,7 +79,14 @@ function parseArgs(argv: string[]): ParsedArgs {
 
 /** Every API key variable the config names, so their values never reach logs. */
 function secretNames(config: SwarmConfig): string[] {
-  const names = new Set(["OLLAMA_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "GEMINI_API_KEY"]);
+  const names = new Set([
+    "OLLAMA_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "NVIDIA_API_KEY",
+    "XAI_API_KEY",
+    "GEMINI_API_KEY",
+  ]);
   for (const provider of Object.values(config.providers)) {
     if (provider.type === "openai_compatible" && provider.apiKeyEnv) names.add(provider.apiKeyEnv);
     if (provider.type === "cli") for (const name of provider.envPass) names.add(name);
@@ -205,6 +213,8 @@ async function main(): Promise<void> {
       return;
     }
   }
+  // Only a process that will own the scheduler needs to probe model capabilities.
+  for (const note of await negotiateOllamaCapabilities(config)) logger.warn({}, note);
   const db = openDatabase(databasePath(config));
   const store = new Store(db);
   if (args.command === "migrate") {
@@ -291,10 +301,16 @@ async function main(): Promise<void> {
   });
   let orchestrator: Orchestrator;
   try {
-    orchestrator = new Orchestrator(store, config, workspace, configProviderResolver(redact), {
-      logger,
-      recoverOnStart: true,
-    });
+    orchestrator = new Orchestrator(
+      store,
+      config,
+      workspace,
+      configProviderResolver(redact, config.costPolicy),
+      {
+        logger,
+        recoverOnStart: true,
+      },
+    );
   } catch (error) {
     store.close();
     if (

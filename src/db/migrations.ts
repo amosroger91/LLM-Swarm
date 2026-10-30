@@ -280,9 +280,24 @@ CREATE INDEX idx_calls_job ON provider_calls(job_id);
   },
   {
     version: 8,
-    name: "provider_failover_and_delegations",
+    name: "provider_fallback_snapshots",
+    sql: `ALTER TABLE agent_profiles ADD COLUMN fallbacks_json TEXT NOT NULL DEFAULT '[]';`,
+  },
+  {
+    version: 9,
+    name: "durable_planner_chat",
+    sql: `CREATE TABLE planner_chats (
+      id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+      message TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','completed','failed')),
+      error TEXT, started_at TEXT NOT NULL, finished_at TEXT
+    );
+    CREATE UNIQUE INDEX idx_pending_planner_chat ON planner_chats(job_id) WHERE status='pending';
+    CREATE INDEX idx_planner_chat_job ON planner_chats(job_id, started_at);`,
+  },
+  {
+    version: 10,
+    name: "delegations",
     sql: `
-ALTER TABLE agent_profiles ADD COLUMN fallbacks_json TEXT NOT NULL DEFAULT '[]';
 CREATE TABLE delegations (
   id TEXT PRIMARY KEY,
   agent TEXT NOT NULL,

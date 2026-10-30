@@ -52,6 +52,7 @@ providers:
   # ---- strong: planning and review -------------------------------------------------
   claude:
     type: cli
+    costClass: metered
     command: claude
     model: opus # any `claude --model` value: opus, sonnet, haiku, or a full model id
     args:
@@ -89,6 +90,7 @@ providers:
   # Optional Claude Code worker for the `claude` profile (edits its worktree directly).
   claude-worker:
     type: cli
+    costClass: metered
     command: claude
     model: sonnet
     args:
@@ -121,6 +123,7 @@ providers:
   # ---- local: execution ------------------------------------------------------------
   ollama-tools:
     type: openai_compatible
+    costClass: local
     protocol: ollama
     baseUrl: http://127.0.0.1:11434
     model: qwen2.5-coder:7b # a larger coder model (e.g. 14b/32b) gives better results
@@ -138,6 +141,7 @@ providers:
 
   ollama-chat:
     type: openai_compatible
+    costClass: local
     protocol: ollama
     baseUrl: http://127.0.0.1:11434
     model: qwen2.5-coder:7b
@@ -155,6 +159,7 @@ providers:
   # ---- free remote: failover -------------------------------------------------------
   groq:
     type: openai_compatible
+    costClass: free
     baseUrl: https://api.groq.com/openai/v1
     model: llama-3.3-70b-versatile
     apiKeyEnv: GROQ_API_KEY
@@ -169,6 +174,7 @@ providers:
 
   gemini-api:
     type: openai_compatible
+    costClass: free
     baseUrl: https://generativelanguage.googleapis.com/v1beta/openai
     model: gemini-2.5-flash
     apiKeyEnv: GEMINI_API_KEY
@@ -183,6 +189,7 @@ providers:
 
   openrouter-free:
     type: openai_compatible
+    costClass: free
     baseUrl: https://openrouter.ai/api/v1
     model: qwen/qwen3-coder:free
     apiKeyEnv: OPENROUTER_API_KEY
@@ -199,19 +206,19 @@ agents:
   planner:
     role: planner
     provider: claude
-    fallbacks: [gemini-api, ollama-chat]
+    fallbackProviders: [gemini-api, ollama-chat]
   reviewer:
     role: reviewer
     provider: claude
-    fallbacks: [gemini-api, ollama-chat]
+    fallbackProviders: [gemini-api, ollama-chat]
   worker:
     role: worker
     provider: ollama-tools
-    fallbacks: [groq, gemini-api, openrouter-free]
+    fallbackProviders: [groq, gemini-api, openrouter-free]
   delegate:
     role: worker
     provider: ollama-chat
-    fallbacks: [groq, gemini-api, openrouter-free]
+    fallbackProviders: [groq, gemini-api, openrouter-free]
   claude-worker:
     role: worker
     provider: claude-worker
@@ -219,11 +226,11 @@ agents:
   local-planner:
     role: planner
     provider: ollama-chat
-    fallbacks: [gemini-api, groq]
+    fallbackProviders: [gemini-api, groq]
   local-reviewer:
     role: reviewer
     provider: ollama-chat
-    fallbacks: [gemini-api, groq]
+    fallbackProviders: [gemini-api, groq]
 
 profiles:
   hybrid:

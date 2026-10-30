@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { parse } from "yaml";
 import { SwarmError, errorMessage } from "../errors.js";
 import { SwarmConfigSchema, type SwarmConfig } from "./schema.js";
@@ -55,10 +56,40 @@ export function loadConfig(filePath?: string): SwarmConfig {
   try {
     raw = parse(text);
   } catch (error) {
+    const position = (error as { linePos?: Array<{ line: number; col: number }> }).linePos?.[0];
     throw new SwarmError(
-      `Config ${absolute} is not valid YAML: ${errorMessage(error)}`,
+      `Config ${absolute} is not valid YAML${position ? ` at line ${position.line}, column ${position.col}` : ""}. Check its syntax.`,
       "bad_config",
     );
+  }
+  // Accept credentials in an ignored local config, but never snapshot their values.
+  // The provider receives only an environment-variable reference in SQLite.
+  if (raw && typeof raw === "object" && "providers" in raw) {
+    const providers = (raw as { providers?: unknown }).providers;
+    if (providers && typeof providers === "object") {
+      for (const [name, value] of Object.entries(providers)) {
+        if (!value || typeof value !== "object") continue;
+        const provider = value as Record<string, unknown>;
+        const explicitKey =
+          typeof provider.apiKey === "string" ? provider.apiKey.trim() : undefined;
+        if (typeof provider.apiKey === "string") delete provider.apiKey;
+        const literal = explicitKey
+          ? explicitKey
+          : typeof provider.apiKeyEnv === "string" &&
+              /^(?:sk-or-|nvapi-|gsk_)/.test(provider.apiKeyEnv)
+            ? provider.apiKeyEnv
+            : undefined;
+        if (!literal) continue;
+        const slot =
+          typeof provider.apiKeyEnv === "string" &&
+          /^[A-Za-z_][A-Za-z0-9_]*$/.test(provider.apiKeyEnv)
+            ? provider.apiKeyEnv
+            : `SWARM_INLINE_${createHash("sha256").update(`${absolute}:${name}`).digest("hex").slice(0, 16).toUpperCase()}_API_KEY`;
+        process.env[slot] = literal;
+        provider.apiKeyEnv = slot;
+        delete provider.apiKey;
+      }
+    }
   }
   const parsed = SwarmConfigSchema.safeParse(raw);
   if (!parsed.success) {

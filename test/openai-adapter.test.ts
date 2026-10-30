@@ -150,6 +150,88 @@ describe("OpenAI-compatible provider", () => {
     );
   });
 
+  it("rejects oversized requests before contacting a quota-limited provider", async () => {
+    let requests = 0;
+    const baseUrl = await listen((_req, res) => {
+      requests++;
+      res.end("{}");
+    });
+    const provider = new OpenAICompatibleProvider(
+      providerConfig(baseUrl, { apiKeyOptional: true, maxInputChars: 1000 }),
+      "free-tier",
+    );
+    await expect(provider.complete({ prompt: "x".repeat(2000) })).rejects.toMatchObject({
+      code: "context_limit",
+    });
+    expect(requests).toBe(0);
+  });
+
+  it("detects repeated read tools with unchanged arguments and evidence", async () => {
+    const baseUrl = await listen((_req, res) => {
+      res.end(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: "",
+                tool_calls: [
+                  {
+                    id: "loop",
+                    type: "function",
+                    function: { name: "list_files", arguments: "{}" },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      );
+    });
+    const provider = new OpenAICompatibleProvider(
+      providerConfig(baseUrl, {
+        apiKeyOptional: true,
+        capabilities: {
+          structuredOutput: true,
+          toolCalling: true,
+          streaming: false,
+          nonInteractive: true,
+        },
+      }),
+      "looping",
+    );
+    await expect(
+      provider.complete({
+        prompt: "implement",
+        tools: [
+          {
+            name: "list_files",
+            description: "list",
+            parameters: {},
+            execute: async () => ({ files: ["a.ts"] }),
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: "tool_loop" });
+  });
+
+  it("sends the configured thinking toggle through native Ollama", async () => {
+    let body: Record<string, unknown> = {};
+    const baseUrl = await listen((_req, res, input) => {
+      body = input;
+      res.end(
+        JSON.stringify({ model: "qwen3:4b", message: { content: '{"ok":true}' }, done: true }),
+      );
+    });
+    const provider = new OpenAICompatibleProvider(
+      providerConfig(baseUrl, { protocol: "ollama", thinking: false, apiKeyOptional: true }),
+      "local",
+    );
+    expect(
+      (await provider.complete({ prompt: "Return JSON", expectJson: true })).structured,
+    ).toEqual({ ok: true });
+    expect(body.think).toBe(false);
+  });
+
   it("sends a bearer token, usage, and response_format only when JSON mode is actually enabled", async () => {
     const seen: Captured[] = [];
     const baseUrl = await listen((req, res, body) => {
@@ -259,6 +341,52 @@ describe("OpenAI-compatible provider", () => {
     } finally {
       delete process.env.SWARM_TEST_OPENAI_KEY;
     }
+  });
+
+  it("respects a short rate-limit cooldown and records the retry", async () => {
+    let calls = 0;
+    const baseUrl = await listen((_req, res) => {
+      calls++;
+      if (calls === 1) {
+        res.statusCode = 429;
+        res.setHeader("retry-after", "0.01");
+        res.end('{"error":"rate limited"}');
+      } else res.end(JSON.stringify({ choices: [{ message: { content: '{"ok":true}' } }] }));
+    });
+    const observations: Array<{ error?: string }> = [];
+    const provider = new OpenAICompatibleProvider(
+      providerConfig(baseUrl, { apiKeyOptional: true }),
+      "groq",
+    );
+    const result = await provider.complete({
+      prompt: "Return JSON",
+      expectJson: true,
+      onCall: (call) => observations.push(call),
+    });
+    expect(result.structured).toEqual({ ok: true });
+    expect(calls).toBe(2);
+    expect(observations).toHaveLength(2);
+    expect(observations[0]?.error).toContain("HTTP 429");
+    expect(observations[1]?.error).toBeUndefined();
+  });
+
+  it("stops after two rate-limit retries", async () => {
+    let calls = 0;
+    const baseUrl = await listen((_req, res) => {
+      calls++;
+      res.statusCode = 429;
+      res.setHeader("retry-after", "0");
+      res.end("rate limited");
+    });
+    const provider = new OpenAICompatibleProvider(
+      providerConfig(baseUrl, { apiKeyOptional: true }),
+      "groq",
+    );
+    await expect(provider.complete({ prompt: "hi" })).rejects.toMatchObject({
+      code: "http",
+      retryable: true,
+    });
+    expect(calls).toBe(3);
   });
 
   it("maps abort and timeout and refuses a missing required key", async () => {
