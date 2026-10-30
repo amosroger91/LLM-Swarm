@@ -47,6 +47,11 @@ describe("database", () => {
     expect(versions).toEqual([
       { version: 1, name: "initial" },
       { version: 2, name: "scheduler_ownership_and_pinned_base" },
+      { version: 3, name: "coordination_and_measurements" },
+      { version: 4, name: "blockers_and_recovery" },
+      { version: 5, name: "planner_task_proposals" },
+      { version: 6, name: "immutable_human_goal" },
+      { version: 7, name: "clear_resolved_task_errors" },
     ]);
     expect(db.pragma("foreign_keys", { simple: true })).toBe(1);
     expect(String(db.pragma("journal_mode", { simple: true }))).toBe("wal");

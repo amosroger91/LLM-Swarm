@@ -14,6 +14,23 @@ export interface ProviderRequest {
   timeoutMs?: number;
   expectJson?: boolean;
   metadata?: Record<string, string>;
+  tools?: AgentTool[];
+  maxPromptChars?: number;
+  onCall?: (call: {
+    provider: string;
+    model?: string;
+    durationMs: number;
+    usage?: ProviderUsage;
+    error?: string;
+  }) => void;
+  onContextCompacted?: (before: number, after: number) => void;
+}
+
+export interface AgentTool {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  execute(args: unknown): Promise<unknown>;
 }
 
 export interface ProviderResponse {
@@ -23,6 +40,11 @@ export interface ProviderResponse {
   model?: string;
   usage?: ProviderUsage;
   truncated?: boolean;
+  toolCalls?: Array<{
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+  }>;
 }
 
 export interface AgentProvider {

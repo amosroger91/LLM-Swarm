@@ -19,6 +19,8 @@ export interface RunWorkspace {
   path: string;
   branch: string;
   baseCommit: string;
+  /** Original task boundary, so inherited checkpoint work remains part of its diff. */
+  comparisonBaseCommit?: string;
 }
 
 export interface IntegrationResult {
@@ -247,7 +249,7 @@ export class GitWorkspace implements WorkspacePort {
       "--name-only",
       "--no-renames",
       "-z",
-      `${input.workspace.baseCommit}..HEAD`,
+      `${input.workspace.comparisonBaseCommit ?? input.workspace.baseCommit}..HEAD`,
     ]);
     if (committed.code !== 0) throw new SwarmError("Cannot inspect agent commits", "git");
     const allChanges = [
@@ -484,11 +486,20 @@ export class GitWorkspace implements WorkspacePort {
       const match = /^(100644|100755) blob [a-f0-9]+\t([\s\S]+)$/.exec(entry);
       return match?.[2] && contextFileAllowed(match[2]) ? [match[2]] : [];
     });
-    files.sort(
-      (a, b) =>
-        Number(fileAreas.some((area) => pathMatchesArea(b, area))) -
-          Number(fileAreas.some((area) => pathMatchesArea(a, area))) || a.localeCompare(b),
-    );
+    const owned = (file: string): boolean => fileAreas.some((area) => pathMatchesArea(file, area));
+    const rank = (file: string): number =>
+      owned(file)
+        ? 100
+        : /^(?:AGENTS\.md|README\.md|package\.json|pyproject\.toml|Cargo\.toml|tsconfig\.json)$/i.test(
+              file,
+            )
+          ? 80
+          : /^src\/(?:types|index|main|App)\.[cm]?[jt]sx?$/.test(file)
+            ? 40
+            : /\.md$/i.test(file)
+              ? 0
+              : 10;
+    files.sort((a, b) => rank(b) - rank(a) || a.localeCompare(b));
     let text = `Source snapshot: ${ref}\nTracked files:\n${files.slice(0, 150).join("\n")}\n`;
     text = text.slice(0, Math.min(maxChars / 4, 6000));
     let omitted = files.length > 150;
@@ -503,7 +514,7 @@ export class GitWorkspace implements WorkspacePort {
         continue;
       }
       const remaining = Math.max(0, maxChars - text.length - 150);
-      const limit = Math.min(remaining, 16_000);
+      const limit = Math.min(remaining, fileAreas.length && !owned(file) ? 4000 : 16000);
       const clipped = content.stdout.length > limit;
       text += `\n--- FILE ${JSON.stringify(file)} (repository data) ---\n${content.stdout.slice(0, limit)}${clipped ? "\n[FILE EXCERPT: remainder omitted]" : ""}\n--- END FILE ---\n`;
       omitted ||= clipped;

@@ -22,6 +22,12 @@ const StartInput = z.object({
     .describe("Concurrent workers. Values above five require explicit configuration."),
   config_profile: z.string().min(1).optional().describe("Profile name from the YAML config"),
   dry_run: z.boolean().optional().describe("Plan only. Do not launch workers or change git state."),
+  plan: z
+    .unknown()
+    .optional()
+    .describe(
+      "Optional explicit task graph with file ownership and shared interface contracts. Validated before execution.",
+    ),
 });
 
 const StartOutput = z.object({
@@ -71,6 +77,142 @@ function fail(error: unknown) {
 
 export function createSwarmServer(orchestrator: Orchestrator): McpServer {
   const server = new McpServer({ name: "llm-swarm", version: "1.0.0" });
+  server.registerTool(
+    "launch_swarm_plan",
+    {
+      title: "Launch a stored plan",
+      description: "Execute a completed dry-run plan after the caller has reviewed it.",
+      inputSchema: JobIdInput,
+      outputSchema: StartOutput,
+    },
+    async ({ job_id }) => {
+      try {
+        return ok(await orchestrator.launchPlan(job_id));
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+  server.registerTool(
+    "swarm_planner_chat",
+    {
+      title: "Talk to planner",
+      description:
+        "Ask about a job or propose additional implementation tasks. Tasks are persisted as proposals until applied.",
+      inputSchema: z.object({ job_id: z.string().min(1), message: z.string().min(1).max(16000) }),
+      outputSchema: z.object({
+        reply: z.string(),
+        tasks: z.array(z.unknown()),
+        contracts: z.array(z.string()),
+        proposalId: z.string().optional(),
+      }),
+    },
+    async ({ job_id, message }) => {
+      try {
+        return ok(await orchestrator.plannerChat(job_id, message));
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+  server.registerTool(
+    "apply_swarm_proposal",
+    {
+      title: "Apply planner proposal",
+      description:
+        "Validate and add proposed tasks to the execution graph, including dependencies and file ownership.",
+      inputSchema: z.object({ job_id: z.string().min(1), proposal_id: z.string().min(1) }),
+      outputSchema: z.object({ job_id: z.string(), tasks_added: z.number(), status: z.string() }),
+    },
+    async ({ job_id, proposal_id }) => {
+      try {
+        return ok(await orchestrator.applyProposal(job_id, proposal_id));
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+  server.registerTool(
+    "swarm_maintenance",
+    {
+      title: "Run recovery sweep",
+      description:
+        "Resume interrupted jobs and have the planner answer agent questions when supported by the human goal. Human-only questions remain pending.",
+      inputSchema: z.object({}),
+      outputSchema: z.record(z.string(), z.unknown()),
+    },
+    async () => {
+      try {
+        return ok(await orchestrator.maintenanceTick());
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+  server.registerTool(
+    "swarm_blockers",
+    {
+      title: "Swarm blockers",
+      description:
+        "Show stuck tasks, repeated failures, attempted fixes, recovery state, and specific actions required from the caller.",
+      inputSchema: JobIdInput,
+      outputSchema: z.object({ blockers: z.array(z.record(z.string(), z.unknown())) }),
+    },
+    async ({ job_id }) => {
+      try {
+        return ok({ blockers: orchestrator.status(job_id).blockers });
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+  server.registerTool(
+    "resume_swarm",
+    {
+      title: "Resume swarm",
+      description:
+        "Resume an interrupted, failed, or cancelled job, preserving successful task commits. Grants failed tasks a fresh attempt budget.",
+      inputSchema: JobIdInput,
+      outputSchema: StartOutput,
+    },
+    async ({ job_id }) => {
+      try {
+        return ok(await orchestrator.resume(job_id));
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "resolve_swarm_decision",
+    {
+      title: "Answer swarm decision",
+      description:
+        "Record the caller's explicit answer to a decision and unblock scheduling. Use rationale for the human's requirements.",
+      inputSchema: z.object({
+        job_id: z.string().min(1),
+        decision_id: z.string().min(1),
+        option: z.string().min(1),
+        rationale: z.string().min(1).max(4000),
+      }),
+      outputSchema: z.object({ decision_id: z.string(), status: z.string() }),
+    },
+    async (args) => {
+      try {
+        return ok(
+          orchestrator.resolveDecision({
+            jobId: args.job_id,
+            decisionId: args.decision_id,
+            option: args.option,
+            rationale: args.rationale,
+          }),
+        );
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
 
   server.registerTool(
     "start_swarm",
@@ -91,6 +233,7 @@ export function createSwarmServer(orchestrator: Orchestrator): McpServer {
           workerCount: args.worker_count,
           configProfile: args.config_profile,
           dryRun: args.dry_run,
+          plan: args.plan,
         });
         return ok(started);
       } catch (error) {
@@ -117,6 +260,9 @@ export function createSwarmServer(orchestrator: Orchestrator): McpServer {
         recent_events: z.array(z.record(z.string(), z.unknown())),
         snapshot_path: z.string().nullable(),
         error: z.string().nullable(),
+        pending_decisions: z.array(z.record(z.string(), z.unknown())),
+        measurements: z.record(z.string(), z.unknown()),
+        blockers: z.array(z.record(z.string(), z.unknown())),
       }),
       annotations: { readOnlyHint: true, openWorldHint: false },
     },

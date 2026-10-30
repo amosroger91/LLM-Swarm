@@ -18,3 +18,7 @@ worktrees/
 workspaces/
 .DS_Store
 Thumbs.db
+artifacts/
+config/*.local.yaml
+test-results/
+playwright-report/

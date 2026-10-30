@@ -22,7 +22,7 @@ The scheduler claims up to `workerCount` ready tasks. The default count is 2. Th
 
 Claims use an immediate transaction: select one `ready` task, conditional `UPDATE` to `running`, insert the run. Two connections cannot both observe a successful update for the same task.
 
-Provider calls and git commands run outside the database transaction. `finishRun` always runs from success, failure, timeout, or cancel paths, so a thrown provider error does not leave the task `running`. On process restart, `recoverInterrupted` marks queued or running runs `interrupted`, returns a running task to `ready` when attempts remain (otherwise `failed`), and marks an in-flight job `interrupted`. Recovery does not resume the job.
+Provider calls and git commands run outside the database transaction. `finishRun` always runs from success, failure, timeout, or cancel paths, so a thrown provider error does not leave the task `running`. On process restart, `recoverInterrupted` marks queued or running runs `interrupted`, returns a running task to `ready` when attempts remain (otherwise `failed`), and marks an in-flight job `interrupted`. The recurring maintenance sweep or an explicit resume can subsequently restart the job while retaining successful task commits. See [supervision](supervision.md).
 
 Cancellation sets `cancel_requested`, aborts the job's `AbortController`, and does not claim further work. The active scheduler polls persisted cancellation every 100 ms, so CLI cancellation works across processes. Configured checks receive the abort signal. A job timeout is a failure, not a cancellation.
 

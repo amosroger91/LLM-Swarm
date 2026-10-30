@@ -1,0 +1,414 @@
+const $ = (selector) => document.querySelector(selector);
+let token = $('meta[name="swarm-token"]').content;
+const escape = (value) =>
+  String(value ?? "").replace(
+    /[&<>"']/g,
+    (character) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character],
+  );
+const short = (value, limit = 90) =>
+  String(value ?? "").length > limit ? `${String(value).slice(0, limit)}…` : String(value ?? "");
+const date = (value) =>
+  value
+    ? new Date(value).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      })
+    : "—";
+const compact = (value) =>
+  value == null
+    ? "—"
+    : Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(value);
+const duration = (ms) =>
+  ms < 60000
+    ? `${Math.round(ms / 1000)}s`
+    : `${Math.floor(ms / 60000)}m ${Math.round((ms % 60000) / 1000)}s`;
+const badge = (status) =>
+  `<span class="badge ${escape(status)}"><i></i>${escape(status.replaceAll("_", " "))}</span>`;
+const icon = (name) => ({ tasks: "▤", workers: "◈", blockers: "⚑", tokens: "⌁" })[name] ?? "·";
+let state,
+  detail,
+  selected = location.hash.slice(1),
+  tab = "overview",
+  refreshing = false,
+  chatting = false;
+let toastTimer;
+async function api(url, input, renew = true) {
+  const response = await fetch(url, {
+    headers: { "x-swarm-token": token, ...(input ? { "content-type": "application/json" } : {}) },
+    ...(input ? { method: "POST", body: JSON.stringify(input) } : {}),
+  });
+  const data = await response.json();
+  if (response.status === 403 && renew && data.error === "Dashboard session token required") {
+    const page = await (await fetch("/", { cache: "no-store" })).text();
+    const match = /name="swarm-token" content="([^"]+)"/.exec(page);
+    if (match) {
+      token = match[1];
+      return api(url, input, false);
+    }
+  }
+  if (!response.ok) throw new Error(data.error ?? "Request failed");
+  return data;
+}
+function toast(message) {
+  $("#toast").textContent = message;
+  $("#toast").hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => ($("#toast").hidden = true), 6500);
+}
+function jobUrl(action) {
+  return `/api/jobs/${encodeURIComponent(selected)}${action ? `/${action}` : ""}`;
+}
+function choose(id) {
+  selected = id;
+  location.hash = id;
+  detail = undefined;
+  void refresh();
+}
+function renderJobs() {
+  const query = $("#filter-jobs").value.toLowerCase();
+  $("#job-count").textContent = state.jobs.length;
+  $("#jobs").innerHTML =
+    state.jobs
+      .filter((job) => `${job.task} ${job.repoPath}`.toLowerCase().includes(query))
+      .map((job) => {
+        const total = Object.values(job.counts).reduce((sum, value) => sum + value, 0);
+        const done = job.counts.done + job.counts.review;
+        const project = job.repoPath.split(/[\\/]/).at(-1);
+        return `<button class="job-item ${job.id === selected ? "selected" : ""}" data-job="${escape(job.id)}"><div class="job-item-top"><span class="project-icon">${escape(project.slice(0, 1).toUpperCase())}</span><span class="job-project">${escape(project)}</span><i class="job-state ${escape(job.status)}"></i></div><strong>${escape(short(job.goal ?? job.task, 73))}</strong><div class="job-item-meta"><span>${escape(job.status.replaceAll("_", " "))}</span><span>${done}/${total} tasks</span></div><progress max="${total || 1}" value="${done}"></progress>${job.blockers ? `<span class="sidebar-blocker">${job.blockers} blocker${job.blockers === 1 ? "" : "s"} recorded</span>` : ""}</button>`;
+      })
+      .join("") || '<p class="sidebar-empty">No matching missions.</p>';
+}
+function taskCards() {
+  const columns = [
+    ["ready", "Queued"],
+    ["running", "In progress"],
+    ["review", "Ready for review"],
+    ["done", "Completed"],
+    ["blocked", "Blocked / failed"],
+  ];
+  return `<div class="task-board">${columns
+    .map(([status, label]) => {
+      const tasks = detail.tasks.filter((task) =>
+        status === "blocked"
+          ? ["blocked", "failed", "cancelled"].includes(task.status)
+          : status === "review"
+            ? ["review", "revision"].includes(task.status)
+            : task.status === status,
+      );
+      return `<section class="board-column"><h3><i class="column-dot ${status}"></i>${label}<span>${tasks.length}</span></h3>${tasks.map((task) => `<button class="task-card" data-task="${escape(task.id)}"><div class="task-card-id">${escape(task.stableId)} <span>${escape(task.kind)}</span></div><h4>${escape(task.title)}</h4><div class="task-files">${escape(short(task.fileAreas.join(", ") || "Integrated revision", 75))}</div><div class="task-card-bottom">${badge(task.status)}<span>↻ ${task.attemptCount}/${task.maxAttempts}</span></div></button>`).join("") || '<div class="empty-column">Nothing here yet</div>'}</section>`;
+    })
+    .join("")}</div>`;
+}
+function blockers() {
+  const items = detail.status.blockers.filter((item) => item.status !== "resolved");
+  const questions = detail.decisions.filter(
+    (decision) => decision.status === "open" && decision.blocking,
+  );
+  if (!items.length && !questions.length && !detail.job.error)
+    return '<div class="clear-state"><span>✓</span><div><strong>No active blockers</strong><p>The coordinator will surface repeated failures, stalled work, and questions here.</p></div></div>';
+  return `<section class="blocker-section"><div class="section-title"><span class="orange-dot"></span><h2>Needs attention</h2><span>${items.length} blockers · ${questions.length} questions</span></div>${detail.job.error ? `<div class="job-error">${escape(detail.job.error)}</div>` : ""}${items.map((item) => `<article class="blocker-card"><div>${badge(item.status)}<span class="muted">${escape(item.category)} · seen ${item.occurrences}×</span></div><h3>${escape(item.summary)}</h3><p><strong>Next action</strong> ${escape(item.nextAction)}</p><details><summary>Evidence & attempted fixes</summary><pre>${escape(item.details)}\n\n${escape(item.attempts.join("\n"))}</pre></details></article>`).join("")}${questions.map((question) => `<form class="decision-form" data-decision="${escape(question.id)}"><div class="question-label">${question.ownerRole === "human" ? "YOUR ANSWER IS NEEDED" : "PLANNER QUESTION"}</div><h3>${escape(question.question)}</h3>${question.context ? `<p>${escape(question.context)}</p>` : ""}<div class="decision-inputs"><select name="option" aria-label="Decision answer">${question.options.map((option) => `<option value="${escape(option)}">${escape(option)}</option>`).join("")}</select><input name="rationale" placeholder="Give the guidance that will unblock the task…" required maxlength="4000"><button class="primary" type="submit">Send answer →</button></div></form>`).join("")}</section>`;
+}
+function timeline(events = detail.events.slice(-18)) {
+  return `<div class="timeline">${
+    [...events]
+      .reverse()
+      .map(
+        (event) =>
+          `<article><span class="timeline-dot ${event.type.includes("fail") || event.type.includes("blocker") ? "warning" : ""}"></span><time>${date(event.createdAt)}</time><div><strong>${escape(event.type.replaceAll(".", " · ").replaceAll("_", " "))}</strong><p>${escape(short(JSON.stringify(event.payload), 180))}</p></div></article>`,
+      )
+      .join("") || '<p class="muted">Events will appear as the mission progresses.</p>'
+  }</div>`;
+}
+function overview() {
+  const active = detail.runs.filter((run) => ["running", "queued"].includes(run.status));
+  return `${blockers()}<div class="overview-grid"><section class="panel"><div class="section-title"><h2>Agent activity</h2><span>${active.length} active</span></div>${
+    active.length
+      ? active
+          .map((run) => {
+            const task = detail.tasks.find((item) => item.id === run.taskId);
+            return `<div class="worker-row"><span class="worker-avatar">◈</span><div><strong>${escape(task?.stableId ?? run.role)}</strong><p>${escape(short(task?.title ?? "Working", 70))}</p></div><span class="working-indicator">Working<span> · ${duration(Date.now() - Date.parse(run.startedAt))}</span></span></div>`;
+          })
+          .join("")
+      : '<div class="panel-empty"><span>◈</span><p>No agents executing right now.<br>Queued work starts when dependencies are ready.</p></div>'
+  }<div class="supervisor-note"><span class="live-dot"></span><div><strong>${state.maintenance.enabled ? "Goal supervisor is on" : "Automatic supervision is off"}</strong><p>${state.maintenance.enabled ? `Recovery sweep every ${Math.round(state.maintenance.intervalMs / 1000)}s. Answers supported questions and resumes interrupted work.` : "Use the recovery sweep button to inspect pending work."}</p></div></div></section><section class="panel"><div class="section-title"><h2>Verification</h2><span>Evidence before approval</span></div><div class="verification-row"><span>Configured checks</span><strong>${state.checkCount ? `${state.checkCount} commands` : "None configured"}</strong></div><div class="verification-row"><span>Checks required</span><strong>${state.requireChecks ? "Yes" : "No"}</strong></div><div class="verification-row"><span>Review state</span>${badge(detail.job.reviewState ?? "pending")}</div><div class="verification-row"><span>Review rounds</span><strong>${detail.reviews.length} / ${detail.job.maxReviewRounds}</strong></div>${detail.artifacts
+    .filter((item) => item.kind === "checks")
+    .slice(-1)
+    .map((item) => `<pre class="check-evidence">${escape(short(item.summary, 500))}</pre>`)
+    .join(
+      "",
+    )}<p class="small-note">A planner’s answer or worker’s success does not complete the mission. Checks and independent review remain the gate.</p></section></div><section class="panel recent-panel"><div class="section-title"><h2>Recent events</h2><button class="text-button" data-tab="activity">View full activity ↗</button></div>${timeline()}</section>`;
+}
+function tasksView() {
+  const idMap = new Map(detail.tasks.map((task) => [task.id, task]));
+  return `${taskCards()}<section class="panel dependency-panel"><div class="section-title"><h2>Dependency map</h2><span>Work follows the graph</span></div>${detail.tasks.map((task) => `<div class="dependency-row"><button data-task="${escape(task.id)}">${escape(task.stableId)}</button><span>←</span><div>${(detail.dependencies[task.id] ?? []).map((id) => `<button class="dependency-chip" data-task="${escape(id)}">${escape(idMap.get(id)?.stableId ?? id)}</button>`).join("") || '<span class="muted">No prerequisites</span>'}</div>${badge(task.status)}</div>`).join("")}</section>`;
+}
+function artifactsView() {
+  return `<section class="panel"><div class="section-title"><h2>Worktrees & commits</h2><span>${detail.worktrees.length} isolated checkouts</span></div>${detail.worktrees.map((tree) => `<article class="artifact"><div><strong>${escape(tree.branchName)}</strong>${badge(tree.cleanupState)}</div><code>${escape(tree.path)}</code><p>Base ${escape(tree.baseCommit?.slice(0, 12) ?? "—")} → Head ${escape(tree.headCommit?.slice(0, 12) ?? "pending")}</p></article>`).join("") || '<p class="muted">Worktrees appear when agents begin.</p>'}</section><section class="panel artifact-panel"><div class="section-title"><h2>Recorded evidence</h2><span>${detail.artifacts.length} artifacts</span></div>${detail.artifacts.map((item) => `<details class="artifact"><summary>${escape(item.kind)} <time>${date(item.createdAt)}</time></summary><pre>${escape(item.summary)}</pre>${item.path ? `<code>${escape(item.path)}</code>` : ""}</details>`).join("")}</section>`;
+}
+function activityView() {
+  return `<section class="panel"><div class="section-title"><h2>Event stream</h2><span>Latest 100 events</span></div>${timeline(detail.events)}</section><section class="panel artifact-panel"><div class="section-title"><h2>Shared messages</h2><span>Agent handoffs, questions, and findings</span></div>${[
+    ...detail.messages,
+  ]
+    .reverse()
+    .map(
+      (message) =>
+        `<article class="chat-bubble"><div class="chat-label">${escape(message.sender)} · ${escape(message.channel)} / ${escape(message.messageType)}<time>${date(message.createdAt)}</time></div><p>${escape(message.content)}</p></article>`,
+    )
+    .join("")}</section>`;
+}
+function renderMission() {
+  if (!detail) return;
+  if (document.activeElement?.closest(".decision-form")) return;
+  const { job, status, tasks } = detail;
+  const total = tasks.length,
+    done = tasks.filter((task) => task.status === "done").length,
+    implemented = tasks.filter((task) =>
+      ["review", "revision", "done"].includes(task.status),
+    ).length;
+  const metrics = status.measurements;
+  $("#project-name").textContent = job.repoPath.split(/[\\/]/).at(-1);
+  $("#mission").innerHTML =
+    `<section class="mission-header"><div class="mission-kicker"><span class="eyebrow">MISSION ${escape(job.id.slice(0, 8).toUpperCase())}</span>${badge(job.status)}</div><div class="mission-title"><h1>${escape(short(job.goal ?? job.task, 110))}</h1><div class="mission-actions">${["failed", "interrupted", "cancelled"].includes(job.status) ? '<button class="primary" data-action="resume">↻ Resume mission</button>' : !["completed"].includes(job.status) ? '<button class="quiet-button danger" data-action="cancel">Stop mission</button>' : '<span class="complete-label">✓ Mission complete</span>'}</div></div><details class="human-goal"><summary>Human-defined goal <span>↗</span></summary><p>${escape(detail.humanGoal)}</p></details><div class="mission-meta"><span>⌘ ${escape(job.baseBranch)}</span><span>${escape(job.configProfile ?? "default")} profile</span><span>Started ${new Date(job.createdAt).toLocaleString()}</span></div></section><section class="stats"><article><span class="stat-icon purple">${icon("tasks")}</span><div><span>Task progress</span><strong>${done}<small> / ${total}</small></strong><p>${implemented} implemented · ${total - done} to finish</p></div></article><article><span class="stat-icon blue">${icon("workers")}</span><div><span>Agents working</span><strong>${status.active_workers.length}<small> / ${job.workerCount}</small></strong><p>${status.task_counts.ready} ready in queue</p></div></article><article><span class="stat-icon orange">${icon("blockers")}</span><div><span>Needs attention</span><strong>${status.blockers.filter((item) => item.status !== "resolved").length}</strong><p>${status.pending_decisions.length} unanswered questions</p></div></article><article><span class="stat-icon green">${icon("tokens")}</span><div><span>Tokens used</span><strong>${compact(metrics.totalTokens)}</strong><p>${metrics.providerCalls} model calls · ${metrics.retries} retries</p></div></article></section><section class="progress-section"><div><span>MISSION PROGRESS</span><strong>${total ? Math.round((implemented / total) * 100) : 0}% implemented</strong></div><progress value="${implemented}" max="${total || 1}"></progress></section><nav class="view-tabs" aria-label="Mission views">${[
+      ["overview", "Overview"],
+      ["tasks", "Task board"],
+      ["activity", "Activity"],
+      ["artifacts", "Artifacts"],
+    ]
+      .map(
+        ([id, label]) =>
+          `<button class="${tab === id ? "active" : ""}" data-tab="${id}">${label}${id === "tasks" ? `<span>${total}</span>` : ""}</button>`,
+      )
+      .join(
+        "",
+      )}<span class="tab-live"><i class="live-dot"></i>LIVE STATE</span></nav><div class="tab-content">${tab === "overview" ? overview() : tab === "tasks" ? tasksView() : tab === "activity" ? activityView() : artifactsView()}</div>`;
+  $("#mission .stats article:last-child div>span").textContent = "Tokens reported";
+  $("#mission .stats article:last-child p").textContent =
+    `${metrics.callsWithUsage}/${metrics.providerCalls} calls with usage · ${metrics.retries} retries`;
+  if (job.dryRun && job.status === "completed") {
+    $("#mission .mission-actions").innerHTML =
+      '<button class="primary" data-action="launch">Launch this plan →</button>';
+    $("#mission .mission-kicker .badge").outerHTML = badge("plan_ready");
+  }
+  if (tab === "artifacts")
+    $("#mission .tab-content").insertAdjacentHTML(
+      "beforeend",
+      `<section class="panel artifact-panel"><div class="section-title"><h2>Model call evidence</h2><span>${metrics.providerCalls} calls · ${duration(metrics.providerDurationMs)} total provider time</span></div>${metrics.calls
+        .slice(-100)
+        .map(
+          (call) =>
+            `<article class="artifact"><div><strong>${escape(call.role)} · ${escape(call.model ?? call.provider)}</strong><span class="muted">${duration(call.duration_ms)} · ${compact(call.total_tokens)} tokens</span></div>${call.error ? `<pre>${escape(call.error)}</pre>` : ""}</article>`,
+        )
+        .join("")}</section>`,
+    );
+}
+let chatSignature = "";
+function renderChat() {
+  if (!detail) return;
+  const messages = detail.messages.filter(
+    (message) =>
+      message.channel === "planning" ||
+      (message.role === "planner" && message.messageType !== "proposal"),
+  );
+  const signature = selected + JSON.stringify([messages, detail.proposals]);
+  if (signature === chatSignature) return;
+  chatSignature = signature;
+  const nearBottom =
+    $("#chat-messages").scrollHeight -
+      $("#chat-messages").scrollTop -
+      $("#chat-messages").clientHeight <
+    100;
+  $("#chat-messages").innerHTML =
+    messages
+      .map(
+        (message) =>
+          `<article class="chat-bubble ${message.role === "caller" ? "human" : "agent"}"><div class="chat-label">${message.role === "caller" ? "YOU" : escape(message.sender)}<time>${date(message.createdAt)}</time></div><p>${escape(message.content)}</p></article>`,
+      )
+      .join("") +
+      detail.proposals
+        .map(
+          (proposal) =>
+            `<article class="proposal"><div class="proposal-heading">▤ <strong>${proposal.tasks.length} proposed tasks</strong><span>${escape(proposal.status)}</span></div>${proposal.tasks.map((task) => `<div class="proposed-task"><strong>${escape(task.title)}</strong><span>${escape(task.fileAreas.join(", "))}</span></div>`).join("")}${proposal.status === "pending" ? `<button class="primary" data-proposal="${escape(proposal.id)}" ${detail.job.status === "planning" ? "disabled" : ""}>Add tasks to mission →</button>` : '<p class="muted">✓ Tasks handed to the execution queue</p>'}</article>`,
+        )
+        .join("") ||
+    '<div class="chat-empty"><span>✧</span><h3>A good place to think.</h3><p>Ask about this mission, describe a change, or work through what’s blocking progress.</p></div>';
+  if (nearBottom || chatting) $("#chat-messages").scrollTop = $("#chat-messages").scrollHeight;
+}
+async function refresh() {
+  if (refreshing) return;
+  refreshing = true;
+  try {
+    state = await api("/api/state");
+    if (!selected || !state.jobs.some((job) => job.id === selected))
+      selected = state.jobs[0]?.id ?? "";
+    renderJobs();
+    if (selected) {
+      const current = selected;
+      const found = await api(jobUrl());
+      if (selected === current) {
+        detail = found;
+        renderMission();
+        renderChat();
+      }
+    }
+    $("#connection-label").textContent = "Connected";
+    $("#connection-dot").classList.remove("offline");
+    $("#last-refresh").textContent = `SYNCED ${date(state.serverTime)}`;
+    if ($("#new-profile").dataset.profiles !== state.profiles.join("|")) {
+      $("#new-profile").innerHTML = state.profiles
+        .map((profile) => `<option value="${escape(profile)}">${escape(profile)}</option>`)
+        .join("");
+      $("#new-profile").value = state.defaultProfile;
+      $("#new-profile").dataset.profiles = state.profiles.join("|");
+    }
+    $("#checks-note").textContent =
+      `${state.checkCount} verification commands configured. ${state.requireChecks ? "Passing checks are required." : "Unchecked completion is currently permitted by your configuration."}`;
+  } catch (error) {
+    $("#connection-label").textContent = "Connection lost";
+    $("#connection-dot").classList.add("offline");
+    $("#last-refresh").textContent = error.message;
+  } finally {
+    refreshing = false;
+  }
+}
+function showNew() {
+  $("#new-dialog").showModal();
+  $("#new-form [name=task]").focus();
+}
+$("#new-job").addEventListener("click", showNew);
+$("#first-job").addEventListener("click", showNew);
+$("#filter-jobs").addEventListener("input", renderJobs);
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("button");
+  if (!button) return;
+  if (button.classList.contains("close-dialog")) button.closest("dialog").close();
+  if (button.dataset.job) choose(button.dataset.job);
+  if (button.dataset.tab) {
+    tab = button.dataset.tab;
+    renderMission();
+  }
+  if (button.dataset.task) {
+    const task = detail.tasks.find((item) => item.id === button.dataset.task);
+    if (!task) return;
+    $("#task-content").innerHTML =
+      `<span class="eyebrow">${escape(task.stableId)}</span><h2>${escape(task.title)}</h2>${badge(task.status)}<h3>Instructions</h3><pre>${escape(task.instructions)}</pre><h3>Acceptance criteria</h3><ul>${task.acceptanceCriteria.map((item) => `<li>${escape(item)}</li>`).join("")}</ul><h3>File ownership</h3><pre>${escape(task.fileAreas.join("\n"))}</pre>${task.error ? `<h3>Latest failure</h3><pre>${escape(task.error)}</pre>` : ""}`;
+    $("#task-dialog").showModal();
+  }
+  if (button.dataset.action || button.dataset.proposal) {
+    button.disabled = true;
+    try {
+      await api(
+        jobUrl(button.dataset.proposal ? "apply" : button.dataset.action),
+        button.dataset.proposal ? { proposalId: button.dataset.proposal } : {},
+      );
+      toast(
+        button.dataset.proposal
+          ? "Tasks added. The scheduler will follow their dependencies."
+          : "Mission updated.",
+      );
+      await refresh();
+    } catch (error) {
+      toast(error.message);
+      button.disabled = false;
+    }
+  }
+});
+document.addEventListener("submit", async (event) => {
+  if (!event.target.matches(".decision-form")) return;
+  event.preventDefault();
+  const form = event.target;
+  const data = new FormData(form);
+  const button = form.querySelector("button");
+  button.disabled = true;
+  try {
+    await api(jobUrl("resolve"), {
+      decisionId: form.dataset.decision,
+      option: data.get("option"),
+      rationale: data.get("rationale"),
+    });
+    form.reset();
+    document.activeElement?.blur();
+    toast("Answer delivered to the coordinator.");
+    await refresh();
+  } catch (error) {
+    toast(error.message);
+    button.disabled = false;
+  }
+});
+$("#planner-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!selected || chatting) {
+    if (!selected) toast("Create or select a mission first.");
+    return;
+  }
+  const message = $("#planner-message").value.trim();
+  if (!message) return;
+  chatting = true;
+  $("#send-message").disabled = true;
+  $("#planner-pending").hidden = false;
+  $("#planner-message").value = "";
+  try {
+    await api(jobUrl("chat"), { message });
+    await refresh();
+  } catch (error) {
+    toast(error.message);
+    $("#planner-message").value = message;
+  } finally {
+    chatting = false;
+    $("#send-message").disabled = false;
+    $("#planner-pending").hidden = true;
+  }
+});
+$("#new-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const data = new FormData(event.target);
+  const button = $("#start-mission");
+  button.disabled = true;
+  try {
+    const created = await api("/api/jobs", {
+      task: data.get("task"),
+      repoPath: data.get("repoPath"),
+      baseBranch: data.get("baseBranch") || undefined,
+      workerCount: Number(data.get("workerCount")),
+      configProfile: data.get("configProfile"),
+      dryRun: data.get("dryRun") === "on",
+    });
+    $("#new-dialog").close();
+    choose(created.job_id);
+    toast("Mission created. Planning is underway.");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    button.disabled = false;
+  }
+});
+$("#sweep").addEventListener("click", async () => {
+  $("#sweep").disabled = true;
+  try {
+    const result = await api("/api/maintenance", {});
+    toast(
+      `Recovery sweep complete. ${result.resumed?.length ?? 0} resumed; ${result.answered?.length ?? 0} missions with answered questions.`,
+    );
+    await refresh();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    $("#sweep").disabled = false;
+  }
+});
+window.addEventListener("hashchange", () => {
+  if (location.hash.slice(1) !== selected) choose(location.hash.slice(1));
+});
+document.addEventListener("keydown", (event) => {
+  if (
+    event.key.toLowerCase() === "n" &&
+    !event.ctrlKey &&
+    !event.metaKey &&
+    !["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName) &&
+    !$("#new-dialog").open
+  )
+    showNew();
+});
+void refresh();
+setInterval(() => void refresh(), 2000);

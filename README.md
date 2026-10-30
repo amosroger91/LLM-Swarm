@@ -8,6 +8,8 @@ LLM Swarm takes one task, asks a planner for a validated plan, and runs up to fi
 
 ## Architecture
 
+The [local control center](docs/dashboard.md) displays live tasks, dependencies, worker activity, verification, model usage, and planner chat. [Recurring supervision](docs/supervision.md) answers supported worker questions, adds bounded missing work within the human goal, and resumes interrupted jobs. Human-only questions remain explicit decisions. Checks and independent review still determine completion.
+
 ```
 MCP client or CLI
         |
@@ -29,8 +31,10 @@ The scheduler, store, and providers can run without the MCP transport. See [docs
 ```powershell
 npm install
 npm run build
-npm run mcp -- --config config/swarm.example.yaml
+node dist/cli.js dashboard --config config/swarm.example.yaml
 ```
+
+Open `http://127.0.0.1:4317`. For MCP instead, use `npm run mcp -- --config config/swarm.example.yaml`. A database has one scheduler owner; run either the dashboard or an MCP scheduler against it.
 
 Point an MCP client at `node dist/cli.js mcp --config config/swarm.example.yaml` after a build. Configure `checks` for the target repository before starting an implementation job. Checks are required by default; a deliberately unverified experiment can set `requireChecks: false`. With no config file and no `SWARM_CONFIG` variable, the process uses the built-in Ollama profile at `http://127.0.0.1:11434/v1`.
 
@@ -73,6 +77,8 @@ Secrets are read from the environment. The database, config, and logs store the 
 
 `dry_run` stores the plan and does not launch workers or change git.
 
+Additional tools are `resume_swarm`, `launch_swarm_plan`, `swarm_blockers`, `resolve_swarm_decision`, `swarm_planner_chat`, `apply_swarm_proposal`, and `swarm_maintenance`. Native API workers with `toolCalling` enabled can read source, edit assigned files, run configured checks, exchange live messages, and request help. Planner task additions validate the combined dependency graph and file ownership.
+
 ### CLI
 
 | Command             | What it does                                         |
@@ -102,8 +108,8 @@ test/                      Vitest suite, no network and no real agent CLIs
 
 ## Tech stack
 
-- Node.js 22 or newer. This tree was exercised on Node v23.10.0. Current LTS is Node 24; Node 24 was not required for the run.
-- TypeScript, ESM, Zod 4, better-sqlite3, Vitest 3, ESLint 9, Prettier.
+- Node.js 22.12+, Node 24, or Node 26+. This revision was exercised on Node 24.13.0.
+- TypeScript, ESM, Zod 4, better-sqlite3, Vitest 5, ESLint 9, Prettier.
 - MCP TypeScript SDK v2 (`@modelcontextprotocol/server` and `@modelcontextprotocol/client`). This is not the deprecated `@modelcontextprotocol/sdk` v1 package. Tools use `registerTool` with Zod object schemas and `serveStdio`.
 
 ## Notes / conventions
@@ -120,7 +126,7 @@ test/                      Vitest suite, no network and no real agent CLIs
 - The grok, opencode, and gemini profiles in the sample config were checked against local `--help` text on 2026-10-29. They were not called against a live model. `--always-approve` and `--yolo` are left off.
 - A predecessor satisfies its dependents when the task is `review`, `revision`, or `done`. `done` is the post-approval state. Treating only `done` as satisfied would deadlock the job-level review.
 - Deleting `swarm.md` does not change job status.
-- `npm audit` reports issues in Vitest 3's test runner (including tinypool). Installing Vitest 5 and ESLint 10 failed on npm 10.9.2 with an arborist `edgesOut` error, so the project stays on Vitest 3 and ESLint 9. Those findings are in the test toolchain, not in the server runtime.
+- The test runner was upgraded to Vitest 5 after the earlier installation issue. The current dependency audit reports zero vulnerabilities.
 - This project's user-selected remote is [amosroger91/LLM-Swarm](https://github.com/amosroger91/LLM-Swarm). GitHub Actions checks formatting, lint, types, build, and tests on Windows and Linux with Node 22 and 24.
 
 ## Validation
@@ -136,3 +142,5 @@ npm test
 The automated suite uses real temporary Git repositories, mock providers, and separate CLI processes. `npx tsx scripts/ollama-smoke.ts` additionally exercises a live local Ollama model and verifies exact output bytes plus the unchanged base README. Its default model is `qwen2.5-coder:7b`; `SWARM_SMOKE_MODEL` overrides it.
 
 Troubleshooting, backup, and restart behavior are in [docs/troubleshooting.md](docs/troubleshooting.md).
+
+The music-app regression run and initial 10-case comparison are recorded in [the QA notes](docs/qa/2026-10-29-music-and-supervision.md). Reproduce it with `npx tsx scripts/benchmark.ts CONFIG OUTPUT_DIRECTORY`; set `SWARM_BENCHMARK_TOOLS=1` for native Ollama tools. Benchmark and live-model scripts make real provider requests; unit tests use local fixtures.

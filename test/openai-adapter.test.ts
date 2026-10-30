@@ -74,6 +74,73 @@ function listen(
 }
 
 describe("OpenAI-compatible provider", () => {
+  it("compacts older tool evidence while retaining the human goal and newest result", async () => {
+    const captured: Array<Array<Record<string, unknown>>> = [];
+    const baseUrl = await listen((_req, res, body) => {
+      captured.push(body.messages as Array<Record<string, unknown>>);
+      const round = captured.length;
+      res.end(
+        JSON.stringify({
+          choices: [
+            {
+              message:
+                round < 3
+                  ? {
+                      content: null,
+                      tool_calls: [
+                        {
+                          id: `call-${round}`,
+                          type: "function",
+                          function: { name: "read", arguments: "{}" },
+                        },
+                      ],
+                    }
+                  : { content: '{"ok":true}' },
+            },
+          ],
+        }),
+      );
+    });
+    const provider = new OpenAICompatibleProvider(
+      providerConfig(baseUrl, {
+        apiKeyOptional: true,
+        apiKeyEnv: undefined,
+        capabilities: {
+          structuredOutput: true,
+          toolCalling: true,
+          streaming: false,
+          nonInteractive: true,
+        },
+      }),
+      "test",
+    );
+    const compactions: Array<[number, number]> = [];
+    let reads = 0;
+    const result = await provider.complete({
+      prompt: "Immutable human goal",
+      system: "Keep the original requirements",
+      expectJson: true,
+      maxPromptChars: 12000,
+      onContextCompacted: (before, after) => compactions.push([before, after]),
+      tools: [
+        {
+          name: "read",
+          description: "Read evidence",
+          parameters: { type: "object" },
+          execute: async () => ({ evidence: `${++reads}:` + "x".repeat(6500) }),
+        },
+      ],
+    });
+    expect(result.structured).toEqual({ ok: true });
+    expect(compactions).toHaveLength(1);
+    expect(compactions[0]![1]).toBeLessThan(compactions[0]![0]);
+    expect(captured[2]![0]!.content).toBe("Keep the original requirements");
+    expect(captured[2]![1]!.content).toBe("Immutable human goal");
+    const evidence = captured[2]!.filter((message) => message.role === "tool");
+    expect(JSON.parse(evidence[0]!.content as string)).toMatchObject({ compacted: true });
+    expect(JSON.parse(evidence[1]!.content as string).evidence).toContain("2:");
+  });
+
   it("builds the chat completions URL", () => {
     expect(completionsUrl("http://127.0.0.1:11434/v1")).toBe(
       "http://127.0.0.1:11434/v1/chat/completions",

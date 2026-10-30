@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="swarm-token" content="__SWARM_TOKEN__" />
+    <meta name="color-scheme" content="dark" />
+    <title>Swarm — Control Center</title>
+    <link rel="stylesheet" href="/style.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <a href="/" class="brand"
+          ><span class="brand-icon">S</span><strong>swarm<span> / </span></strong
+          ><span class="brand-caption">CONTROL CENTER</span></a
+        >
+        <div class="workspace-label">
+          <span class="live-dot"></span>LOCAL WORKSPACE<span class="local-tag">SQLite</span>
+        </div>
+        <button class="new-job primary" id="new-job">
+          ＋ <span>New mission</span><kbd>N</kbd>
+        </button>
+        <div class="job-search">
+          <span>⌕</span
+          ><input id="filter-jobs" aria-label="Filter missions" placeholder="Find a mission…" />
+        </div>
+        <div class="list-heading">MISSIONS <span id="job-count">0</span></div>
+        <nav id="jobs" aria-label="Missions">
+          <p class="sidebar-empty">Connecting to your workspace…</p>
+        </nav>
+        <div class="sidebar-footer">
+          <div>
+            <span class="live-dot" id="connection-dot"></span
+            ><span id="connection-label">Connecting</span><span class="version">v1.0</span>
+          </div>
+          <p>Local execution. Complete visibility.</p>
+        </div>
+      </aside>
+      <div class="workspace">
+        <header class="topbar">
+          <div class="breadcrumb">
+            Workspace <span>/</span> <strong id="project-name">Overview</strong>
+          </div>
+          <div class="topbar-actions">
+            <span class="refresh-label" id="last-refresh">LIVE UPDATES</span
+            ><button class="quiet-button" id="sweep">↻ <span>Run recovery sweep</span></button
+            ><span class="user-avatar">R</span>
+          </div>
+        </header>
+        <div id="global-warning" hidden></div>
+        <div class="main-layout">
+          <main id="mission">
+            <section class="welcome">
+              <span class="eyebrow">READY WHEN YOU ARE</span>
+              <h1>A clear view of<br />everything in motion.</h1>
+              <p>Your agents, decisions, and progress. One place to guide the work.</p>
+              <button class="primary" id="first-job">Create a mission →</button>
+            </section>
+          </main>
+          <aside class="planner">
+            <div class="planner-heading">
+              <span class="planner-avatar">✦</span>
+              <div>
+                <h2>Planning room</h2>
+                <p>Your goal. A shared direction.</p>
+              </div>
+              <span class="agent-tag">PLANNER</span>
+            </div>
+            <div class="planner-info">
+              Talk through a blocker, refine the approach, or turn an idea into tasks for your
+              agents.
+            </div>
+            <div id="chat-messages" class="chat-messages">
+              <div class="chat-empty">
+                <span>✧</span>
+                <h3>Think out loud.</h3>
+                <p>
+                  Select a mission to talk with its planning agent. Proposed tasks appear here
+                  before they enter the queue.
+                </p>
+              </div>
+            </div>
+            <div id="planner-pending" hidden>
+              <span class="thinking-dot"></span> Planner is considering your message…
+            </div>
+            <form id="planner-form">
+              <label for="planner-message" class="sr-only">Message the planner</label
+              ><textarea
+                id="planner-message"
+                placeholder="What should we work through?"
+                rows="3"
+                maxlength="16000"
+                required
+              ></textarea>
+              <div class="composer-footer">
+                <span>Guidance becomes shared context</span
+                ><button
+                  class="send-button"
+                  type="submit"
+                  id="send-message"
+                  aria-label="Send to planner"
+                >
+                  ↑
+                </button>
+              </div>
+            </form>
+            <p class="planner-footnote">Automatic supervision stays within your original goal.</p>
+          </aside>
+        </div>
+      </div>
+    </div>
+    <dialog id="new-dialog">
+      <form id="new-form">
+        <div class="dialog-header">
+          <div>
+            <span class="eyebrow">LET’S MAKE SOMETHING HAPPEN</span>
+            <h2>Start a new mission</h2>
+          </div>
+          <button type="button" class="close-dialog" aria-label="Close">×</button>
+        </div>
+        <label
+          >What should the swarm accomplish?<textarea
+            name="task"
+            rows="5"
+            placeholder="Describe the goal, constraints, and how we’ll know it’s finished…"
+            required
+            maxlength="20000"
+          ></textarea></label
+        ><label
+          >Repository folder<input
+            name="repoPath"
+            placeholder="C:\Users\roger\dev\your-project"
+            required
+        /></label>
+        <div class="form-grid">
+          <label>Base branch<input name="baseBranch" placeholder="Current branch" /></label
+          ><label
+            >Workers<input
+              name="workerCount"
+              type="number"
+              min="1"
+              max="5"
+              value="2"
+              required /></label
+          ><label>Model profile<select name="configProfile" id="new-profile"></select></label>
+        </div>
+        <label class="checkbox-label"
+          ><input type="checkbox" name="dryRun" /> Plan only — review the graph before launching
+          workers</label
+        >
+        <p class="muted" id="checks-note"></p>
+        <div class="dialog-actions">
+          <button type="button" class="quiet-button close-dialog">Cancel</button
+          ><button class="primary" type="submit" id="start-mission">Launch mission →</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="task-dialog">
+      <button class="close-dialog task-close" aria-label="Close">×</button>
+      <div id="task-content"></div>
+    </dialog>
+    <div id="toast" role="status" hidden></div>
+  </body>
+</html>

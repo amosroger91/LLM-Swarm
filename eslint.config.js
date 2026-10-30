@@ -10,10 +10,33 @@ export default tseslint.config(
       ".swarm-data/**",
       "workspaces/**",
       "**/*.db",
+      "artifacts/**",
+      "test-results/**",
     ],
   },
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
+  {
+    files: ["scripts/**/*.mjs"],
+    languageOptions: {
+      globals: { fetch: "readonly", console: "readonly", setTimeout: "readonly" },
+    },
+  },
+  {
+    files: ["web/**/*.js"],
+    languageOptions: {
+      globals: {
+        document: "readonly",
+        window: "readonly",
+        location: "readonly",
+        fetch: "readonly",
+        setInterval: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+        FormData: "readonly",
+      },
+    },
+  },
   {
     languageOptions: { globals: { process: "readonly" } },
     rules: {

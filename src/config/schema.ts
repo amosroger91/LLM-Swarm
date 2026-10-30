@@ -25,6 +25,10 @@ const OpenAIProviderSchema = z
     timeoutMs: z.number().int().positive().max(3_600_000).default(120_000),
     jsonMode: z.enum(["off", "json_object"]).default("off"),
     temperature: z.number().min(0).max(2).optional(),
+    maxToolRounds: z.number().int().min(1).max(100).optional(),
+    maxOutputTokens: z.number().int().positive().max(100000).optional(),
+    protocol: z.enum(["openai", "ollama"]).optional(),
+    contextTokens: z.number().int().min(2048).max(262144).optional(),
     capabilities: CapabilitiesSchema,
   })
   .strict();
@@ -33,6 +37,7 @@ const CliProviderSchema = z
   .object({
     type: z.literal("cli"),
     command: z.string().min(1),
+    fileEditing: z.boolean().optional(),
     args: z.array(z.string()).max(100),
     promptTransport: z.enum(["argv", "stdin", "file"]).default("argv"),
     outputParser: z
@@ -108,6 +113,7 @@ export const SwarmConfigSchema = z
     maxReviewRounds: z.number().int().positive().max(10).default(3),
     jobTimeoutMs: z.number().int().positive().default(1_800_000),
     providerTimeoutMs: z.number().int().positive().default(120_000),
+    agentTimeoutMs: z.number().int().positive().max(3600000).default(900000),
     maxPromptChars: z.number().int().positive().default(80_000),
     maxResponseChars: z.number().int().positive().default(200_000),
     maxMessageChars: z.number().int().positive().default(16_000),
@@ -115,6 +121,22 @@ export const SwarmConfigSchema = z
     logLevel: z.enum(["debug", "info", "warn", "error"]).default("info"),
     writeSnapshot: z.boolean().default(true),
     requireChecks: z.boolean().default(true),
+    recovery: z
+      .object({
+        enabled: z.boolean().default(true),
+        maxAssistsPerTask: z.number().int().min(0).max(3).default(1),
+        stallWarningMs: z.number().int().min(100).default(60000),
+      })
+      .prefault({}),
+    maintenance: z
+      .object({
+        enabled: z.boolean().default(true),
+        intervalMs: z.number().int().min(1000).default(30000),
+        maxAutoResumes: z.number().int().min(0).max(10).default(3),
+        maxPlanningRounds: z.number().int().min(0).max(10).default(3),
+        maxTasksAdded: z.number().int().min(0).max(20).default(10),
+      })
+      .prefault({}),
     gitAuthorName: z.string().min(1).default("LLM Swarm"),
     gitAuthorEmail: z.string().min(3).default("swarm@localhost"),
     decision: z
@@ -122,9 +144,10 @@ export const SwarmConfigSchema = z
         policy: z.enum(["owner", "majority", "unanimous"]).default("owner"),
         quorum: z.number().int().positive().default(1),
         ownerRole: z.enum(["planner", "reviewer"]).default("reviewer"),
+        blockOnQuestions: z.boolean().default(true),
       })
       .strict()
-      .default({ policy: "owner", quorum: 1, ownerRole: "reviewer" }),
+      .default({ policy: "owner", quorum: 1, ownerRole: "reviewer", blockOnQuestions: true }),
     git: z
       .object({
         cleanupWorktrees: z.boolean().default(false),

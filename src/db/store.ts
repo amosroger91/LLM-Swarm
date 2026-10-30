@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import os from "node:os";
 import { z } from "zod";
 import type { ProviderConfig } from "../config/schema.js";
@@ -15,8 +15,28 @@ import {
 } from "../domain.js";
 import { SwarmError } from "../errors.js";
 import { withBusyRetry, type SqliteDatabase } from "./connection.js";
+import type { ProviderUsage } from "../providers/types.js";
 
 const StringArray = z.array(z.string());
+
+export interface BlockerRecord {
+  id: string;
+  jobId: string;
+  taskId: string | null;
+  runId: string | null;
+  category: string;
+  status: string;
+  summary: string;
+  details: string;
+  nextAction: string;
+  attempts: string[];
+  occurrences: number;
+  assists: number;
+  decisionId: string | null;
+  resolution: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
 
 export interface JobRecord {
   id: string;
@@ -117,6 +137,7 @@ export interface MessageRecord {
 }
 
 export interface DecisionRecord {
+  blocking: boolean;
   id: string;
   jobId: string;
   question: string;
@@ -442,6 +463,7 @@ export class Store {
           now,
         );
       this.addEvent(id, "job.created", "job", id, { status: "planning", dryRun: input.dryRun });
+      this.db.prepare("UPDATE jobs SET human_goal = ? WHERE id = ?").run(input.task, id);
       if (input.baseCommit) this.pinBaseCommit(id, input.baseCommit);
     });
     return this.mustJob(id);
@@ -939,9 +961,16 @@ export class Store {
       this.db
         .prepare(
           `UPDATE tasks SET status = ?, updated_at = ?, result_summary = COALESCE(?, result_summary),
-           error = COALESCE(?, error) WHERE id = ?`,
+           error = CASE WHEN ? = 'succeeded' THEN NULL ELSE COALESCE(?, error) END WHERE id = ?`,
         )
-        .run(nextTaskStatus, now, input.summary ?? null, input.error ?? null, input.taskId);
+        .run(
+          nextTaskStatus,
+          now,
+          input.summary ?? null,
+          input.runStatus,
+          input.error ?? null,
+          input.taskId,
+        );
       if (input.headCommit) {
         this.db
           .prepare("UPDATE worktrees SET head_commit = ?, updated_at = ? WHERE run_id = ?")
@@ -1251,6 +1280,7 @@ export class Store {
   }
 
   createDecision(input: {
+    blocking?: boolean;
     jobId: string;
     question: string;
     context?: string;
@@ -1288,6 +1318,7 @@ export class Store {
           now,
         );
       this.addEvent(input.jobId, "decision.opened", "decision", id, { question: input.question });
+      if (input.blocking) this.db.prepare("UPDATE decisions SET blocking = 1 WHERE id = ?").run(id);
     });
     return this.mustDecision(id);
   }
@@ -1313,6 +1344,7 @@ export class Store {
           resolution_policy: "owner" | "majority" | "unanimous";
           quorum: number;
           owner_role: string;
+          blocking: number;
           final_option: string | null;
           final_rationale: string | null;
           created_at: string;
@@ -1333,6 +1365,7 @@ export class Store {
       resolutionPolicy: row.resolution_policy,
       quorum: row.quorum,
       ownerRole: row.owner_role,
+      blocking: row.blocking === 1,
       finalOption: row.final_option,
       finalRationale: row.final_rationale,
       createdAt: row.created_at,
@@ -1477,6 +1510,21 @@ export class Store {
         );
       }
       this.resolveUnlocked(decision, input.option, input.rationale, input.actor);
+      if (input.option === "stop_job") this.requestCancel(decision.jobId);
+      const blocker = this.listBlockers(decision.jobId).find(
+        (item) => item.decisionId === decision.id,
+      );
+      if (blocker) {
+        if (input.option === "stop_job") this.requestCancel(decision.jobId);
+        else if (blocker.taskId)
+          this.grantRecoveryAttempt(blocker.taskId, `Human guidance: ${input.rationale}`);
+        this.updateBlocker(blocker.id, {
+          status: "resolved",
+          resolution: `${input.option}: ${input.rationale}`,
+          nextAction:
+            input.option === "stop_job" ? "Cancellation requested" : "Retry with caller guidance",
+        });
+      }
       return this.mustDecision(input.decisionId);
     });
   }
@@ -1583,7 +1631,19 @@ export class Store {
   }): ArtifactRecord {
     const id = randomUUID();
     const now = this.now();
-    const summary = input.summary.slice(0, 8000);
+    let summary = input.summary;
+    if (input.kind === "checks" && summary.length > 8000) {
+      const parsed = JSON.parse(summary) as { status: string; summary: string };
+      let limit = Math.min(parsed.summary.length, 6000);
+      do {
+        summary = JSON.stringify({
+          status: parsed.status,
+          summary: parsed.summary.slice(0, limit),
+          truncated: true,
+        });
+        limit = Math.floor(limit * 0.8);
+      } while (summary.length > 8000);
+    } else summary = summary.slice(0, 8000);
     this.db
       .prepare(
         `INSERT INTO artifacts (id, job_id, task_id, run_id, kind, path, summary, created_at)
@@ -1683,5 +1743,460 @@ export class Store {
     this.db
       .prepare("UPDATE jobs SET snapshot_path = ?, updated_at = ? WHERE id = ?")
       .run(snapshotPath, this.now(), jobId);
+  }
+
+  resumeJob(jobId: string): JobRecord {
+    return this.immediate(() => {
+      const job = this.mustJob(jobId);
+      if (!["failed", "interrupted", "cancelled"].includes(job.status)) {
+        throw new SwarmError(`Cannot resume a ${job.status} job`, "bad_state");
+      }
+      if (this.activeRuns(jobId).length)
+        throw new SwarmError("Job still has active runs", "bad_state");
+      for (const task of this.listTasks(jobId)) {
+        if (!["failed", "cancelled"].includes(task.status)) continue;
+        this.db
+          .prepare(
+            `UPDATE tasks SET status = 'blocked', max_attempts = attempt_count + ?, error = NULL, updated_at = ? WHERE id = ?`,
+          )
+          .run(job.maxAttempts, this.now(), task.id);
+      }
+      const status = this.listTasks(jobId).length ? "running" : "planning";
+      this.db
+        .prepare(
+          `UPDATE jobs SET status = ?, error = NULL, final_report = NULL, completed_at = NULL,
+        cancel_requested_at = NULL, max_review_rounds = review_round + ?, review_state = 'pending', updated_at = ? WHERE id = ?`,
+        )
+        .run(status, job.maxReviewRounds, this.now(), jobId);
+      this.refreshReadyUnlocked(jobId);
+      this.addEvent(jobId, "job.resumed", "job", jobId, { from: job.status, status });
+      return this.mustJob(jobId);
+    });
+  }
+
+  activatePlan(jobId: string): void {
+    const job = this.mustJob(jobId);
+    if (!job.dryRun || job.status !== "completed" || !this.listTasks(jobId).length)
+      throw new SwarmError("Only a completed dry-run plan can be launched", "bad_state");
+    this.db
+      .prepare(
+        "UPDATE jobs SET status='running', dry_run=0, error=NULL, final_report=NULL, completed_at=NULL, review_state='pending', updated_at=? WHERE id=?",
+      )
+      .run(this.now(), jobId);
+    this.addEvent(jobId, "plan.launched", "job", jobId, {});
+  }
+
+  recordProviderCall(input: {
+    jobId: string;
+    taskId?: string;
+    role: string;
+    provider: string;
+    model?: string;
+    durationMs: number;
+    usage?: ProviderUsage;
+    error?: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO provider_calls (job_id, task_id, role, provider, model, duration_ms, input_tokens, output_tokens, total_tokens, error, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.jobId,
+        input.taskId ?? null,
+        input.role,
+        input.provider,
+        input.model ?? null,
+        Math.round(input.durationMs),
+        input.usage?.inputTokens ?? null,
+        input.usage?.outputTokens ?? null,
+        input.usage?.totalTokens ?? null,
+        input.error ?? null,
+        this.now(),
+      );
+    this.addEvent(
+      input.jobId,
+      "provider.call_finished",
+      input.taskId ? "task" : "job",
+      input.taskId ?? input.jobId,
+      {
+        role: input.role,
+        provider: input.provider,
+        durationMs: input.durationMs,
+        totalTokens: input.usage?.totalTokens ?? null,
+        error: input.error ?? null,
+      },
+    );
+  }
+
+  measurements(jobId: string): Record<string, unknown> {
+    const calls = this.db
+      .prepare(
+        "SELECT role, provider, model, duration_ms, input_tokens, output_tokens, total_tokens, error FROM provider_calls WHERE job_id = ? ORDER BY id",
+      )
+      .all(jobId) as Array<{
+      duration_ms: number;
+      input_tokens: number | null;
+      output_tokens: number | null;
+      total_tokens: number | null;
+      error: string | null;
+    }>;
+    const job = this.mustJob(jobId);
+    const sum = (key: "input_tokens" | "output_tokens" | "total_tokens"): number | null => {
+      const known = calls.filter((call) => call[key] !== null);
+      return known.length ? known.reduce((total, call) => total + (call[key] ?? 0), 0) : null;
+    };
+    return {
+      elapsedMs: Date.parse(job.completedAt ?? this.now()) - Date.parse(job.createdAt),
+      providerCalls: calls.length,
+      providerDurationMs: calls.reduce((sum, call) => sum + call.duration_ms, 0),
+      inputTokens: sum("input_tokens"),
+      outputTokens: sum("output_tokens"),
+      totalTokens: sum("total_tokens"),
+      callsWithUsage: calls.filter((call) => call.total_tokens !== null).length,
+      failedCalls: calls.filter((call) => call.error !== null).length,
+      retries: this.listTasks(jobId).reduce(
+        (sum, task) => sum + Math.max(0, task.attemptCount - 1),
+        0,
+      ),
+      humanMessages: this.listMessages(jobId, 10000).filter((message) => message.role === "caller")
+        .length,
+      calls,
+    };
+  }
+
+  reportBlocker(input: {
+    jobId: string;
+    taskId?: string;
+    runId?: string;
+    category: string;
+    summary: string;
+    details: string;
+    nextAction: string;
+    attempted?: string;
+  }): BlockerRecord {
+    const fingerprint = createHash("sha256")
+      .update(`${input.taskId ?? "job"}:${input.category}`)
+      .digest("hex");
+    const existing = this.db
+      .prepare("SELECT id FROM blockers WHERE job_id = ? AND fingerprint = ?")
+      .get(input.jobId, fingerprint) as { id: string } | undefined;
+    const now = this.now();
+    const id = existing?.id ?? randomUUID();
+    const old = existing
+      ? this.listBlockers(input.jobId).find((item) => item.id === id)
+      : undefined;
+    const attempts = [
+      ...(old?.attempts ?? []),
+      ...(input.attempted ? [input.attempted] : []),
+    ].slice(-20);
+    this.db
+      .prepare(
+        `INSERT INTO blockers (id, job_id, task_id, run_id, category, fingerprint, summary, details, next_action, attempts_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(job_id, fingerprint) DO UPDATE SET occurrences = occurrences + 1, status = 'open', run_id = excluded.run_id, summary = excluded.summary,
+      details = excluded.details, next_action = excluded.next_action, attempts_json = excluded.attempts_json, updated_at = excluded.updated_at`,
+      )
+      .run(
+        id,
+        input.jobId,
+        input.taskId ?? null,
+        input.runId ?? null,
+        input.category,
+        fingerprint,
+        input.summary.slice(0, 1000),
+        input.details.slice(0, 8000),
+        input.nextAction,
+        JSON.stringify(attempts),
+        now,
+        now,
+      );
+    this.addEvent(input.jobId, "blocker.reported", "blocker", id, {
+      taskId: input.taskId,
+      category: input.category,
+      nextAction: input.nextAction,
+    });
+    this.postMessage({
+      jobId: input.jobId,
+      sender: "coordinator",
+      role: "system",
+      taskId: input.taskId,
+      messageType: "finding",
+      content: `[BLOCKER: ${input.category}] ${input.summary}\nNext: ${input.nextAction}`,
+      maxChars: 8000,
+    });
+    return this.listBlockers(input.jobId).find((item) => item.id === id)!;
+  }
+
+  listBlockers(jobId: string): BlockerRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM blockers WHERE job_id = ? ORDER BY created_at, id")
+      .all(jobId) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      id: row.id as string,
+      jobId: row.job_id as string,
+      taskId: row.task_id as string | null,
+      runId: row.run_id as string | null,
+      category: row.category as string,
+      status: row.status as string,
+      summary: row.summary as string,
+      details: row.details as string,
+      nextAction: row.next_action as string,
+      attempts: strings(row.attempts_json as string),
+      occurrences: row.occurrences as number,
+      assists: row.assists as number,
+      decisionId: row.decision_id as string | null,
+      resolution: row.resolution as string | null,
+      createdAt: row.created_at as string,
+      updatedAt: row.updated_at as string,
+    }));
+  }
+
+  updateBlocker(
+    id: string,
+    patch: {
+      status: string;
+      nextAction: string;
+      resolution?: string;
+      decisionId?: string;
+      assist?: boolean;
+    },
+  ): void {
+    const previous = this.db
+      .prepare("SELECT job_id,task_id,summary,status FROM blockers WHERE id=?")
+      .get(id) as
+      { job_id: string; task_id: string | null; summary: string; status: string } | undefined;
+    this.db
+      .prepare(
+        `UPDATE blockers SET status = ?, next_action = ?, resolution = COALESCE(?, resolution), decision_id = COALESCE(?, decision_id), assists = assists + ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(
+        patch.status,
+        patch.nextAction,
+        patch.resolution ?? null,
+        patch.decisionId ?? null,
+        patch.assist ? 1 : 0,
+        this.now(),
+        id,
+      );
+    if (previous && patch.status === "resolved" && previous.status !== "resolved") {
+      this.addEvent(previous.job_id, "blocker.resolved", "blocker", id, {
+        resolution: patch.resolution,
+        nextAction: patch.nextAction,
+      });
+      this.postMessage({
+        jobId: previous.job_id,
+        taskId: previous.task_id,
+        sender: "coordinator",
+        role: "system",
+        messageType: "status",
+        content: `[RESOLVED] ${previous.summary}\n${patch.resolution ?? patch.nextAction}`,
+        maxChars: 8000,
+      });
+    }
+  }
+
+  grantRecoveryAttempt(taskId: string, guidance: string): void {
+    this.db
+      .prepare(
+        `UPDATE tasks SET max_attempts = MAX(max_attempts, attempt_count + 1), instructions = substr(instructions || ?, 1, 30000),
+      status = CASE WHEN status IN ('failed', 'blocked') THEN 'ready' ELSE status END, updated_at = ? WHERE id = ?`,
+      )
+      .run(`\n\nRecovery guidance:\n${guidance}`, this.now(), taskId);
+  }
+
+  resolveTaskBlockers(jobId: string, taskId: string): void {
+    for (const blocker of this.listBlockers(jobId).filter(
+      (item) => item.taskId === taskId && item.status !== "resolved",
+    )) {
+      if (blocker.decisionId && this.mustDecision(blocker.decisionId).status === "open") continue;
+      this.updateBlocker(blocker.id, {
+        status: "resolved",
+        nextAction: "Task proceeds to integration and review",
+        resolution: "Task produced a validated commit",
+      });
+    }
+  }
+
+  recordCheckpoint(
+    jobId: string,
+    taskId: string,
+    runId: string,
+    headCommit: string,
+    workspacePath: string,
+  ): void {
+    this.db
+      .prepare("UPDATE agent_runs SET head_commit = ? WHERE id = ? AND status = 'running'")
+      .run(headCommit, runId);
+    this.db
+      .prepare("UPDATE worktrees SET head_commit = ?, updated_at = ? WHERE run_id = ?")
+      .run(headCommit, this.now(), runId);
+    this.insertArtifact({
+      jobId,
+      taskId,
+      runId,
+      kind: "checkpoint",
+      path: workspacePath,
+      summary: `Validated partial file ownership; implementation remains unfinished. Commit ${headCommit}`,
+    });
+    this.addEvent(jobId, "run.checkpointed", "run", runId, { headCommit });
+  }
+
+  delegateDecisionToPlanner(decisionId: string): void {
+    const decision = this.mustDecision(decisionId);
+    if (decision.ownerRole === "human")
+      throw new SwarmError("Human-only questions cannot be delegated automatically", "forbidden");
+    if (decision.ownerRole === "planner") return;
+    this.db
+      .prepare("UPDATE decisions SET owner_role = 'planner' WHERE id = ? AND status = 'open'")
+      .run(decisionId);
+    this.addEvent(decision.jobId, "decision.delegated", "decision", decisionId, {
+      from: decision.ownerRole,
+      to: "planner",
+      reason: "Routine agent question assigned to the authorized goal supervisor",
+    });
+  }
+
+  saveProposal(
+    jobId: string,
+    message: string,
+    reply: string,
+    tasks: unknown[],
+    contracts: string[],
+  ): string {
+    const id = randomUUID();
+    this.db
+      .prepare(
+        "INSERT INTO task_proposals (id, job_id, message, reply, tasks_json, contracts_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(id, jobId, message, reply, JSON.stringify(tasks), JSON.stringify(contracts), this.now());
+    return id;
+  }
+
+  proposals(jobId: string): Array<{
+    id: string;
+    jobId: string;
+    message: string;
+    reply: string;
+    tasks: unknown[];
+    contracts: string[];
+    status: string;
+  }> {
+    const rows = this.db
+      .prepare("SELECT * FROM task_proposals WHERE job_id = ? ORDER BY created_at")
+      .all(jobId) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      id: row.id as string,
+      jobId: row.job_id as string,
+      message: row.message as string,
+      reply: row.reply as string,
+      tasks: JSON.parse(row.tasks_json as string) as unknown[],
+      contracts: strings(row.contracts_json as string),
+      status: row.status as string,
+    }));
+  }
+
+  appendTasks(
+    jobId: string,
+    proposalId: string,
+    tasks: PlannedTaskInput[],
+    planJson: string,
+    guidance: string,
+  ): void {
+    this.immediate(() => {
+      const job = this.mustJob(jobId);
+      const proposal = this.proposals(jobId).find((item) => item.id === proposalId);
+      if (!proposal || proposal.status !== "pending")
+        throw new SwarmError("Proposal is missing or already applied", "bad_state");
+      if (job.status === "planning" || job.status === "cancel_requested")
+        throw new SwarmError("Wait for planning or cancellation to finish", "bad_state");
+      if (["failed", "interrupted", "cancelled"].includes(job.status)) this.resumeJob(jobId);
+      const now = this.now();
+      const existing = this.listTasks(jobId);
+      const ids = new Map(existing.map((task) => [task.stableId, task.id]));
+      for (const task of tasks) {
+        const id = randomUUID();
+        if (ids.has(task.stableId))
+          throw new SwarmError(`Duplicate task ${task.stableId}`, "bad_plan");
+        ids.set(task.stableId, id);
+        this.db
+          .prepare(
+            `INSERT INTO tasks (id, job_id, stable_id, title, instructions, acceptance_criteria_json, suggested_role, file_areas_json, status, kind, attempt_count, max_attempts, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'blocked', 'implementation', 0, ?, ?, ?)`,
+          )
+          .run(
+            id,
+            jobId,
+            task.stableId,
+            task.title,
+            task.instructions,
+            JSON.stringify(task.acceptanceCriteria),
+            task.suggestedRole ?? "worker",
+            JSON.stringify(task.fileAreas),
+            job.maxAttempts,
+            now,
+            now,
+          );
+        this.addEvent(jobId, "task.created", "task", id, {
+          stableId: task.stableId,
+          source: "planner-chat",
+        });
+      }
+      const latestRevision = existing.filter((task) => task.kind === "revision").at(-1);
+      for (const task of tasks) {
+        for (const dependency of new Set([
+          ...task.dependencies.map((stableId) => {
+            const id = ids.get(stableId);
+            if (!id) throw new SwarmError(`Unknown dependency ${stableId}`, "bad_plan");
+            return id;
+          }),
+          ...(latestRevision ? [latestRevision.id] : []),
+        ])) {
+          this.db
+            .prepare(
+              "INSERT INTO task_dependencies (job_id, task_id, depends_on_task_id) VALUES (?, ?, ?)",
+            )
+            .run(jobId, ids.get(task.stableId)!, dependency);
+        }
+      }
+      this.db
+        .prepare(
+          `UPDATE jobs SET status = 'running', dry_run = 0, task = task || ?, plan_json = ?, final_report = NULL, error = NULL,
+        completed_at = NULL, review_state = 'pending', max_review_rounds = MAX(max_review_rounds, review_round + 3), updated_at = ? WHERE id = ?`,
+        )
+        .run(`\n\nAdditional request from planner chat:\n${guidance}`, planJson, now, jobId);
+      this.db.prepare("UPDATE task_proposals SET status = 'applied' WHERE id = ?").run(proposalId);
+      this.refreshReadyUnlocked(jobId);
+      this.addEvent(jobId, "plan.extended", "job", jobId, {
+        proposalId,
+        tasks: tasks.map((task) => task.stableId),
+      });
+    });
+  }
+
+  humanGoal(jobId: string): string {
+    const row = this.db.prepare("SELECT human_goal, task FROM jobs WHERE id = ?").get(jobId) as
+      { human_goal: string | null; task: string } | undefined;
+    if (!row) throw new SwarmError("Unknown job", "not_found");
+    return row.human_goal ?? row.task;
+  }
+
+  escalateDecision(decisionId: string, question: string): void {
+    const decision = this.mustDecision(decisionId);
+    this.db
+      .prepare(
+        "UPDATE decisions SET owner_role = 'human', resolution_policy = 'owner', blocking = 1, context = COALESCE(context, '') || ? WHERE id = ? AND status = 'open'",
+      )
+      .run(`\nPlanner escalation: ${question}`, decisionId);
+    this.addEvent(decision.jobId, "decision.escalated", "decision", decisionId, { question });
+    this.postMessage({
+      jobId: decision.jobId,
+      sender: "planner",
+      role: "planner",
+      messageType: "question",
+      content: `Human answer required: ${question}`,
+      decisionId,
+      maxChars: 8000,
+    });
   }
 }

@@ -10,7 +10,7 @@ Start it with `npm run mcp` or `node dist/cli.js mcp`. An optional config is `--
 
 ## A job stays `interrupted` after a restart
 
-That is recovery, not a resume. Runs that were `queued` or `running` become `interrupted`. A running task returns to `ready` when attempts remain, otherwise it becomes `failed`. The job itself becomes `interrupted` and is not picked up automatically. Start a new job for another attempt. Calling recovery twice is safe. A terminal job stays terminal.
+Startup recovery marks unfinished runs `interrupted`. A running task returns to `ready` when attempts remain, otherwise it becomes `failed`. Recurring maintenance or explicit resume can restart the job without rerunning successful prerequisites. Human-only pending decisions and capped recovery budgets prevent automatic retries. Use the dashboard or `node dist/cli.js resume JOB --config CONFIG`. Invalid stored plans require corrected work or a new job. See [supervision](supervision.md) for the external Windows watchdog that can restore a dead scheduler.
 
 ## Workers never start
 

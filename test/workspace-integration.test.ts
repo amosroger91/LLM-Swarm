@@ -6,6 +6,7 @@ import { Orchestrator } from "../src/orchestration/service.js";
 import type { SwarmConfig } from "../src/config/schema.js";
 import { createChecksRunner } from "../src/orchestration/checks.js";
 import { validatePlan } from "../src/orchestration/planner.js";
+import { SwarmError } from "../src/errors.js";
 import {
   doneResult,
   git,
@@ -49,6 +50,95 @@ function fixture(handlers: RoleHandlers, patch: Partial<SwarmConfig> = {}) {
 const approve = () => jsonResponse({ approved: true, summary: "verified fixture", findings: [] });
 
 describe("nested agent integration", () => {
+  it("applies a read-only CLI worker's patch without requiring direct filesystem edits", async () => {
+    const { repo, store, orchestrator } = fixture(
+      {
+        planner: () => jsonResponse(planValue([{ id: "a" }])),
+        worker: (request) => {
+          expect(request.system).toContain("You have no shell and no editor");
+          expect(request.prompt).toContain("patch field as a unified diff");
+          expect(fs.existsSync(path.join(request.cwd!, "a.txt"))).toBe(false);
+          return jsonResponse({
+            ...doneResult(),
+            patch:
+              "diff --git a/a.txt b/a.txt\nnew file mode 100644\n--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+checked patch\n",
+          });
+        },
+        reviewer: approve,
+      },
+      {
+        providers: {
+          ollama: {
+            type: "cli",
+            command: process.execPath,
+            args: [],
+            fileEditing: false,
+            promptTransport: "stdin",
+            outputParser: "fenced-json",
+            timeoutMs: 5000,
+            capabilities: {
+              structuredOutput: true,
+              toolCalling: false,
+              streaming: false,
+              nonInteractive: true,
+            },
+            envPass: [],
+            maxStdoutBytes: 100000,
+            documentedStatus: "help-checked",
+            notes: "Read-only fixture",
+          },
+        },
+      },
+    );
+    try {
+      const job = await orchestrator.startJob({ task: "Create a", repoPath: repo });
+      await orchestrator.waitFor(job.job_id);
+      expect(store.mustJob(job.job_id).status).toBe("completed");
+      expect(
+        fs.readFileSync(path.join(repo, "workspaces", job.job_id, "integration/a.txt"), "utf8"),
+      ).toBe("checked patch\n");
+    } finally {
+      await orchestrator.shutdown();
+      store.close();
+    }
+  });
+  it.each([false, true])(
+    "retries from a scoped checkpoint without approving the failed attempt (already finished: %s)",
+    async (alreadyFinished) => {
+      let attempts = 0;
+      const { repo, store, orchestrator } = fixture({
+        planner: () => jsonResponse(planValue([{ id: "a" }])),
+        worker: (request) => {
+          const file = path.join(request.cwd!, "a.txt");
+          if (++attempts === 1) {
+            fs.writeFileSync(file, "first\n");
+            throw new SwarmError("request timeout", "timeout", true);
+          }
+          expect(fs.readFileSync(file, "utf8")).toBe("first\n");
+          if (!alreadyFinished) fs.appendFileSync(file, "second\n");
+          return jsonResponse(doneResult());
+        },
+        reviewer: approve,
+      });
+      try {
+        const job = await orchestrator.startJob({ task: "checkpoint progress", repoPath: repo });
+        await orchestrator.waitFor(job.job_id);
+        expect(store.mustJob(job.job_id).status).toBe("completed");
+        const runs = store.listRuns(job.job_id);
+        expect(runs[0]!.status).toBe("timed_out");
+        expect(runs[1]!.baseCommit).toBe(runs[0]!.headCommit);
+        expect(
+          fs.readFileSync(path.join(repo, "workspaces", job.job_id, "integration/a.txt"), "utf8"),
+        ).toBe(alreadyFinished ? "first\n" : "first\nsecond\n");
+        expect(
+          store.listArtifacts(job.job_id).some((artifact) => artifact.kind === "checkpoint"),
+        ).toBe(true);
+      } finally {
+        await orchestrator.shutdown();
+        store.close();
+      }
+    },
+  );
   it("cleans successful agent worktrees when requested and reports their final state", async () => {
     const { repo, store, orchestrator } = fixture(
       {

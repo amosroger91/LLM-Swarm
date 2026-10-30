@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { validateFilePath } from "../safety/files.js";
 
 export const PlanTaskSchema = z.object({
   id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/),
@@ -17,6 +18,7 @@ export const PlanSchema = z.object({
   risks: z.array(z.string().max(1000)).max(20).default([]),
   assumptions: z.array(z.string().max(1000)).max(20).default([]),
   questions: z.array(z.string().max(1000)).max(20).default([]),
+  contracts: z.array(z.string().min(1).max(2000)).max(30).default([]),
 });
 
 export type Plan = z.infer<typeof PlanSchema>;
@@ -113,6 +115,20 @@ export function validatePlan(
   }
   const plan = parsed.data;
   const errors: string[] = [];
+  for (const task of plan.tasks) {
+    task.fileAreas = task.fileAreas.map((area) =>
+      area.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, ""),
+    );
+    for (const area of task.fileAreas) {
+      try {
+        validateFilePath(area);
+      } catch {
+        errors.push(
+          `task ${task.id} has invalid fileArea ${JSON.stringify(area)}. Use repository-relative paths without leading slashes or globs.`,
+        );
+      }
+    }
+  }
   const ids = new Set<string>();
   for (const task of plan.tasks) {
     if (ids.has(task.id)) errors.push(`duplicate task id ${task.id}`);
@@ -235,6 +251,11 @@ function filesToPatch(files: unknown): string | undefined {
 export function coerceWorkerResult(input: unknown): unknown {
   if (!input || typeof input !== "object" || Array.isArray(input)) return input;
   const value = { ...(input as Record<string, unknown>) };
+  if (
+    typeof value.patch === "string" &&
+    /^(?:none|null|n\/?a|not (?:needed|required|applicable))\.?$/i.test(value.patch.trim())
+  )
+    delete value.patch;
   const status = typeof value.status === "string" ? value.status.trim().toLowerCase() : "";
   if (DONE_STATUSES.has(status)) value.status = "done";
   else if (FAIL_STATUSES.has(status)) value.status = "failed";
@@ -293,6 +314,7 @@ export const WorkerResultSchema = z.object({
         question: z.string().min(1).max(1000),
         context: z.string().max(4000).optional(),
         options: z.array(z.string().min(1).max(200)).min(2).max(8),
+        blocking: z.boolean().optional(),
       }),
     )
     .max(5)
@@ -314,6 +336,14 @@ export function coerceReviewResult(input: unknown): unknown {
     else if (REJECTED_WORDS.has(word)) value.approved = false;
   }
   if (!Array.isArray(value.findings)) value.findings = [];
+  value.findings = (value.findings as unknown[]).map((finding) => {
+    if (!finding || typeof finding !== "object") return finding;
+    const copy = { ...(finding as Record<string, unknown>) };
+    // A bad optional locator must not discard an otherwise actionable rejection.
+    if (typeof copy.line !== "number" || !Number.isInteger(copy.line) || copy.line <= 0)
+      delete copy.line;
+    return copy;
+  });
   if (value.approved === false && (value.findings as unknown[]).length === 0) {
     const summary =
       typeof value.summary === "string" && value.summary.trim().length > 0
@@ -355,6 +385,17 @@ export const ReviewResultSchema = z
       .optional(),
   })
   .superRefine((value, ctx) => {
+    if (
+      value.approved &&
+      value.findings.some(
+        (finding) => finding.severity === "major" || finding.severity === "critical",
+      )
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["approved"],
+        message: "Approval cannot contain unresolved major or critical findings",
+      });
     if (!value.approved && value.findings.length === 0) {
       ctx.addIssue({
         code: "custom",

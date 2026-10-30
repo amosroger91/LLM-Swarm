@@ -73,7 +73,7 @@ const JOB_TRANSITIONS: Record<JobStatus, readonly JobStatus[]> = {
 const TASK_TRANSITIONS: Record<TaskStatus, readonly TaskStatus[]> = {
   blocked: ["ready", "failed", "cancelled"],
   ready: ["running", "failed", "cancelled"],
-  running: ["review", "ready", "failed", "cancelled"],
+  running: ["review", "ready", "blocked", "failed", "cancelled"],
   review: ["done", "revision", "failed", "cancelled"],
   revision: ["done", "failed", "cancelled", "review"],
   done: ["review"],

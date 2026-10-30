@@ -14,7 +14,30 @@ Load order:
 
 `openai_compatible` fields: `baseUrl`, `model`, optional `apiKeyEnv`, `apiKeyOptional`, `jsonMode` (`off` or `json_object`), `timeoutMs`, `temperature`, and `capabilities`.
 
-`cli` fields: `command`, `args`, `promptTransport` (`argv`, `stdin`, or `file`), `outputParser`, `timeoutMs`, `capabilities`, `envPass`, `maxStdoutBytes`, `documentedStatus`, and `notes`.
+Additional optional fields are `protocol` (`openai` or `ollama`), `contextTokens`, `maxOutputTokens`, and `maxToolRounds`. Native Ollama uses `/api/chat`, `options.num_ctx`, and native tool arguments. The OpenAI-compatible endpoint uses `/chat/completions`; context-window control is not assumed to be supported there.
+
+```yaml
+type: openai_compatible
+protocol: ollama
+baseUrl: http://127.0.0.1:11434
+model: YOUR_INSTALLED_MODEL
+apiKeyOptional: true
+jsonMode: json_object
+contextTokens: 16384
+maxOutputTokens: 4096
+maxToolRounds: 16
+capabilities:
+  structuredOutput: true
+  toolCalling: true
+  streaming: false
+  nonInteractive: true
+```
+
+Tool workers operate in bounded turns with scoped file access, configured checks, coordination tools, and explicit help requests. `providerTimeoutMs` bounds an HTTP request, `agentTimeoutMs` bounds the complete tool turn, and `jobTimeoutMs` bounds the job. Roles can already use different providers/models through their agent profiles. See [supervision](supervision.md) for recovery and maintenance limits.
+
+`cli` fields: `command`, `args`, `promptTransport` (`argv`, `stdin`, or `file`), `outputParser`, `timeoutMs`, `capabilities`, `envPass`, `maxStdoutBytes`, `documentedStatus`, `notes`, and optional `fileEditing`.
+
+Set `fileEditing: false` for a read-only CLI that returns patches from supplied context. Workers then receive the patch-only contract; the coordinator validates ownership, applies the diff, and runs required checks. The default preserves CLI workers that edit their own worktree directly. This describes the provider's capabilities and does not change its sandbox or command policy.
 
 `capabilities` is `structuredOutput`, `toolCalling`, `streaming`, and `nonInteractive`. Workers with `structuredOutput: false` may return plain text, which is stored as a done result. Planners and reviewers always require JSON.
 
@@ -47,6 +70,7 @@ decision:
   policy: owner # owner | majority | unanimous
   quorum: 1
   ownerRole: reviewer
+  blockOnQuestions: true
 git:
   cleanupWorktrees: false
   preserveOnFailure: true
@@ -73,6 +97,7 @@ An empty list records `not_run`. The default `requireChecks: true` fails that jo
 | `maxReviewRounds`    | 3       |
 | `jobTimeoutMs`       | 1800000 |
 | `providerTimeoutMs`  | 120000  |
+| `agentTimeoutMs`     | 900000  |
 | `maxPromptChars`     | 80000   |
 | `maxResponseChars`   | 200000  |
 | `maxMessageChars`    | 16000   |

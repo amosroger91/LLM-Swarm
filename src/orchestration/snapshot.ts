@@ -1,12 +1,19 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { DecisionRecord, JobRecord, ReviewRecord, TaskRecord } from "../db/store.js";
+import type {
+  BlockerRecord,
+  DecisionRecord,
+  JobRecord,
+  ReviewRecord,
+  TaskRecord,
+} from "../db/store.js";
 
 export function renderSnapshot(input: {
   job: JobRecord;
   tasks: TaskRecord[];
   decisions: DecisionRecord[];
   reviews: ReviewRecord[];
+  blockers?: BlockerRecord[];
 }): string {
   const lines = [
     "<!-- GENERATED FILE. Do not edit. Source of truth is the SQLite database. This file is not a lock, queue, or coordination database. -->",
@@ -34,6 +41,13 @@ export function renderSnapshot(input: {
     lines.push(`- ${decision.status}: ${decision.question}`);
     if (decision.finalOption)
       lines.push(`  resolved: ${decision.finalOption} — ${decision.finalRationale ?? ""}`);
+  }
+  if (input.blockers?.length) {
+    lines.push("", "## Blockers and recovery");
+    for (const blocker of input.blockers)
+      lines.push(
+        `- [${blocker.status}] ${blocker.id}: ${blocker.summary}\n  Seen: ${blocker.occurrences}; recovery assists: ${blocker.assists}\n  Tried: ${blocker.attempts.join("; ") || "none recorded"}\n  Next: ${blocker.nextAction}${blocker.decisionId ? `\n  Decision: ${blocker.decisionId}` : ""}${blocker.resolution ? `\n  Resolution: ${blocker.resolution}` : ""}`,
+      );
   }
   lines.push("", "## Reviews");
   if (input.reviews.length === 0) lines.push("(none)");

@@ -5,6 +5,7 @@ export interface Migration {
 }
 
 export const MIGRATIONS: readonly Migration[] = [
+  // Additive migrations preserve existing runs and worktree evidence.
   {
     version: 1,
     name: "initial",
@@ -220,5 +221,61 @@ CREATE TABLE scheduler_owner (
   hostname TEXT NOT NULL
 );
 `,
+  },
+  {
+    version: 3,
+    name: "coordination_and_measurements",
+    sql: `
+ALTER TABLE decisions ADD COLUMN blocking INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE provider_calls (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  task_id TEXT,
+  role TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT,
+  duration_ms INTEGER NOT NULL,
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  total_tokens INTEGER,
+  error TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_calls_job ON provider_calls(job_id);
+`,
+  },
+  {
+    version: 4,
+    name: "blockers_and_recovery",
+    sql: `CREATE TABLE blockers (
+      id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+      task_id TEXT, run_id TEXT, category TEXT NOT NULL, fingerprint TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open', summary TEXT NOT NULL, details TEXT NOT NULL,
+      next_action TEXT NOT NULL, attempts_json TEXT NOT NULL DEFAULT '[]',
+      occurrences INTEGER NOT NULL DEFAULT 1, assists INTEGER NOT NULL DEFAULT 0,
+      decision_id TEXT REFERENCES decisions(id), resolution TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      UNIQUE(job_id, fingerprint)
+    );
+    CREATE INDEX idx_blockers_job ON blockers(job_id, status);`,
+  },
+  {
+    version: 5,
+    name: "planner_task_proposals",
+    sql: `
+    CREATE TABLE task_proposals (id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id),
+      message TEXT NOT NULL, reply TEXT NOT NULL, tasks_json TEXT NOT NULL, contracts_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL);
+  `,
+  },
+  {
+    version: 6,
+    name: "immutable_human_goal",
+    sql: `ALTER TABLE jobs ADD COLUMN human_goal TEXT; UPDATE jobs SET human_goal = task;`,
+  },
+  {
+    version: 7,
+    name: "clear_resolved_task_errors",
+    sql: `UPDATE tasks SET error=NULL WHERE status IN ('review','revision','done') AND EXISTS (SELECT 1 FROM agent_runs WHERE agent_runs.task_id=tasks.id AND agent_runs.status='succeeded');`,
   },
 ];
