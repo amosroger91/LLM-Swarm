@@ -52,6 +52,7 @@ describe("database", () => {
       { version: 5, name: "planner_task_proposals" },
       { version: 6, name: "immutable_human_goal" },
       { version: 7, name: "clear_resolved_task_errors" },
+      { version: 8, name: "provider_failover_and_delegations" },
     ]);
     expect(db.pragma("foreign_keys", { simple: true })).toBe(1);
     expect(String(db.pragma("journal_mode", { simple: true }))).toBe("wal");

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { parse } from "yaml";
 import { SwarmError, errorMessage } from "../errors.js";
@@ -69,9 +70,19 @@ export function loadConfig(filePath?: string): SwarmConfig {
   const baseDir = path.dirname(absolute);
   return {
     ...parsed.data,
-    dataDir: path.resolve(baseDir, parsed.data.dataDir),
-    database: parsed.data.database ? path.resolve(baseDir, parsed.data.database) : undefined,
+    dataDir: path.resolve(baseDir, expandHome(parsed.data.dataDir)),
+    database: parsed.data.database
+      ? path.resolve(baseDir, expandHome(parsed.data.database))
+      : undefined,
   };
+}
+
+/** `~/x` means the user's home directory, so one data directory can serve every project. */
+export function expandHome(value: string): string {
+  if (value === "~") return os.homedir();
+  if (value.startsWith("~/") || value.startsWith("~\\"))
+    return path.join(os.homedir(), value.slice(2));
+  return value;
 }
 
 export function databasePath(config: SwarmConfig): string {

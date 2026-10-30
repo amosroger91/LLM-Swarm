@@ -6,7 +6,8 @@ import { z } from "zod";
 import type { Store } from "../db/store.js";
 import type { SwarmConfig } from "../config/schema.js";
 import type { Orchestrator } from "../orchestration/service.js";
-import { errorMessage } from "../errors.js";
+import { SwarmError, errorMessage } from "../errors.js";
+import { BACKEND_METHODS, writeDashboardInfo, type BackendMethod } from "../mcp/backend.js";
 
 /** Loopback-only control surface. No SQL endpoint, permissive CORS, or remote binding. */
 export async function startDashboard(
@@ -14,7 +15,8 @@ export async function startDashboard(
   orchestrator: Orchestrator,
   config: SwarmConfig,
   port = 4317,
-): Promise<{ server: http.Server; url: string }> {
+  options: { anyPort?: boolean; advertise?: boolean } = {},
+): Promise<{ server: http.Server; url: string; token: string }> {
   const token = randomBytes(32).toString("hex");
   const assets = new Map([
     ["/", { file: "index.html", type: "text/html; charset=utf-8" }],
@@ -27,12 +29,12 @@ export async function startDashboard(
     response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
     response.end(JSON.stringify(data));
   };
-  const body = async (request: http.IncomingMessage): Promise<unknown> => {
+  const body = async (request: http.IncomingMessage, limit = 100_000): Promise<unknown> => {
     const chunks: Buffer[] = [];
     let bytes = 0;
     for await (const chunk of request) {
       bytes += (chunk as Buffer).length;
-      if (bytes > 100000) throw new Error("Request body exceeds 100 KB");
+      if (bytes > limit) throw new Error(`Request body exceeds ${Math.round(limit / 1000)} KB`);
       chunks.push(chunk as Buffer);
     }
     return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
@@ -119,6 +121,13 @@ export async function startDashboard(
         });
         return;
       }
+      if (request.method === "GET" && pathname === "/api/providers") {
+        json(response, 200, {
+          ...orchestrator.providersView(),
+          delegations: store.listDelegations(30),
+        });
+        return;
+      }
       const match = /^\/api\/jobs\/([^/]+)(?:\/([^/]+))?$/.exec(pathname);
       if (request.method === "GET" && match && !match[2]) {
         json(response, 200, detail(decodeURIComponent(match[1]!)));
@@ -128,7 +137,21 @@ export async function startDashboard(
         json(response, 405, { error: "Method not allowed" });
         return;
       }
-      const input = await body(request);
+      const input = await body(request, pathname === "/api/rpc" ? 4_000_000 : 100_000);
+      if (pathname === "/api/rpc") {
+        // MCP clients in other processes drive this scheduler through the same methods
+        // they would call in-process. Only listed orchestrator methods are reachable.
+        const { method, args } = z
+          .object({ method: z.string(), args: z.array(z.unknown()).max(10) })
+          .parse(input);
+        if (!(BACKEND_METHODS as readonly string[]).includes(method)) {
+          json(response, 404, { error: `Unknown method ${method}` });
+          return;
+        }
+        const target = orchestrator[method as BackendMethod] as (...values: unknown[]) => unknown;
+        json(response, 200, { result: await target.apply(orchestrator, args) });
+        return;
+      }
       if (pathname === "/api/jobs") {
         const start = z
           .object({
@@ -200,16 +223,40 @@ export async function startDashboard(
           json(response, 404, { error: "Unknown action" });
       }
     })().catch((error) => {
-      if (!response.headersSent) json(response, 400, { error: errorMessage(error) });
+      if (!response.headersSent)
+        json(response, 400, {
+          error: errorMessage(error),
+          ...(error instanceof SwarmError ? { code: error.code } : {}),
+        });
       else response.end();
     });
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(port, "127.0.0.1", resolve);
-  });
+  // Delegations and waits can legitimately hold a request open for many minutes.
+  server.requestTimeout = 0;
+  server.headersTimeout = 60_000;
+  const listen = (value: number) =>
+    new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(value, "127.0.0.1", () => {
+        server.off("error", reject);
+        resolve();
+      });
+    });
+  try {
+    await listen(port);
+  } catch (error) {
+    if (!options.anyPort || (error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
+    await listen(0);
+  }
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Dashboard did not bind");
   origin = `http://127.0.0.1:${address.port}`;
-  return { server, url: origin };
+  if (options.advertise !== false)
+    writeDashboardInfo(config.dataDir, {
+      url: origin,
+      token,
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+    });
+  return { server, url: origin, token };
 }

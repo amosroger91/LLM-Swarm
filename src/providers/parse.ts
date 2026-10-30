@@ -1,8 +1,11 @@
 import { SwarmError } from "../errors.js";
+import type { ProviderUsage } from "./types.js";
 
 export interface ParsedOutput {
   text: string;
   structured?: unknown;
+  usage?: ProviderUsage;
+  model?: string;
 }
 
 export type OutputParser = (stdout: string, stderr: string) => ParsedOutput;
@@ -125,4 +128,39 @@ registerOutputParser("opencode-events", (stdout) => {
     }
   }
   return withStructured(parts.join("\n") || stdout);
+});
+// Claude Code: `claude -p --output-format json` prints one result envelope.
+registerOutputParser("claude-json", (stdout) => {
+  let envelope: Record<string, unknown> | null = null;
+  try {
+    envelope = asRecord(JSON.parse(stdout.trim()) as unknown);
+  } catch {
+    // Some versions print a JSON array of events; the result is the last one.
+    try {
+      const events = JSON.parse(stdout.trim()) as unknown;
+      if (Array.isArray(events)) envelope = asRecord(events.at(-1));
+    } catch {
+      return withStructured(stdout);
+    }
+  }
+  if (!envelope) return withStructured(stdout);
+  const text = typeof envelope.result === "string" ? envelope.result : (findText(envelope) ?? "");
+  if (envelope.is_error === true || (envelope.subtype && envelope.subtype !== "success")) {
+    throw new SwarmError(
+      `Claude Code returned ${String(envelope.subtype ?? "an error")}: ${text.slice(0, 1000)}`,
+      "exit",
+      true,
+    );
+  }
+  const usage = asRecord(envelope.usage);
+  const parsed = withStructured(text);
+  if (usage) {
+    const input =
+      (Number(usage.input_tokens) || 0) +
+      (Number(usage.cache_read_input_tokens) || 0) +
+      (Number(usage.cache_creation_input_tokens) || 0);
+    const output = Number(usage.output_tokens) || 0;
+    parsed.usage = { inputTokens: input, outputTokens: output, totalTokens: input + output };
+  }
+  return parsed;
 });

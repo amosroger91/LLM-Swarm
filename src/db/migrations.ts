@@ -278,4 +278,27 @@ CREATE INDEX idx_calls_job ON provider_calls(job_id);
     name: "clear_resolved_task_errors",
     sql: `UPDATE tasks SET error=NULL WHERE status IN ('review','revision','done') AND EXISTS (SELECT 1 FROM agent_runs WHERE agent_runs.task_id=tasks.id AND agent_runs.status='succeeded');`,
   },
+  {
+    version: 8,
+    name: "provider_failover_and_delegations",
+    sql: `
+ALTER TABLE agent_profiles ADD COLUMN fallbacks_json TEXT NOT NULL DEFAULT '[]';
+CREATE TABLE delegations (
+  id TEXT PRIMARY KEY,
+  agent TEXT NOT NULL,
+  provider TEXT,
+  model TEXT,
+  prompt_chars INTEGER NOT NULL,
+  context_chars INTEGER NOT NULL,
+  output_chars INTEGER NOT NULL,
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  duration_ms INTEGER NOT NULL,
+  failover_json TEXT NOT NULL DEFAULT '[]',
+  error TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_delegations_time ON delegations(created_at);
+`,
+  },
 ];

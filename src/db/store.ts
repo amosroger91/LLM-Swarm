@@ -78,8 +78,26 @@ export interface AgentProfileRecord {
   providerName: string;
   model: string | null;
   config: ProviderConfig;
+  /** Snapshotted failover chain, tried after the primary provider. */
+  fallbacks: Array<{ name: string; config: ProviderConfig }>;
   capabilitiesJson: string;
   systemPrompt: string | null;
+  createdAt: string;
+}
+
+export interface DelegationRecord {
+  id: string;
+  agent: string;
+  provider: string | null;
+  model: string | null;
+  promptChars: number;
+  contextChars: number;
+  outputChars: number;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  durationMs: number;
+  failover: Array<{ provider: string; kind: string; error: string }>;
+  error: string | null;
   createdAt: string;
 }
 
@@ -566,6 +584,7 @@ export class Store {
       role: "planner" | "worker" | "reviewer";
       providerName: string;
       config: ProviderConfig;
+      fallbacks?: Array<{ name: string; config: ProviderConfig }>;
       systemPrompt?: string;
     }>,
   ): void {
@@ -574,8 +593,8 @@ export class Store {
       const insert = this.db.prepare(
         `INSERT INTO agent_profiles (
           id, job_id, name, role, provider_type, provider_name, model, config_json,
-          capabilities_json, system_prompt, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          capabilities_json, system_prompt, created_at, fallbacks_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       for (const profile of profiles) {
         const model = "model" in profile.config ? profile.config.model : null;
@@ -591,6 +610,7 @@ export class Store {
           JSON.stringify(profile.config.capabilities),
           profile.systemPrompt ?? null,
           now,
+          JSON.stringify(profile.fallbacks ?? []),
         );
       }
     });
@@ -612,10 +632,14 @@ export class Store {
           capabilities_json: string;
           system_prompt: string | null;
           created_at: string;
+          fallbacks_json: string;
         }
       | undefined;
     if (!row) throw new SwarmError(`Job ${jobId} has no ${role} profile`, "not_found");
     const config = ProviderConfigSchema.parse(JSON.parse(row.config_json) as unknown);
+    const fallbacks = z
+      .array(z.object({ name: z.string(), config: ProviderConfigSchema }))
+      .parse(JSON.parse(row.fallbacks_json || "[]") as unknown);
     return {
       id: row.id,
       jobId: row.job_id,
@@ -625,6 +649,7 @@ export class Store {
       providerName: row.provider_name,
       model: row.model,
       config,
+      fallbacks,
       capabilitiesJson: row.capabilities_json,
       systemPrompt: row.system_prompt,
       createdAt: row.created_at,
@@ -1784,6 +1809,79 @@ export class Store {
       )
       .run(this.now(), jobId);
     this.addEvent(jobId, "plan.launched", "job", jobId, {});
+  }
+
+  recordDelegation(input: Omit<DelegationRecord, "id" | "createdAt">): DelegationRecord {
+    const record: DelegationRecord = { ...input, id: randomUUID(), createdAt: this.now() };
+    this.db
+      .prepare(
+        `INSERT INTO delegations (id, agent, provider, model, prompt_chars, context_chars, output_chars,
+          input_tokens, output_tokens, duration_ms, failover_json, error, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        record.id,
+        record.agent,
+        record.provider,
+        record.model,
+        record.promptChars,
+        record.contextChars,
+        record.outputChars,
+        record.inputTokens,
+        record.outputTokens,
+        Math.round(record.durationMs),
+        JSON.stringify(record.failover),
+        record.error,
+        record.createdAt,
+      );
+    return record;
+  }
+
+  listDelegations(limit = 50): DelegationRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM delegations ORDER BY created_at DESC LIMIT ?")
+      .all(limit) as Array<Record<string, string | number | null>>;
+    return rows.map((row) => ({
+      id: String(row.id),
+      agent: String(row.agent),
+      provider: row.provider === null ? null : String(row.provider),
+      model: row.model === null ? null : String(row.model),
+      promptChars: Number(row.prompt_chars),
+      contextChars: Number(row.context_chars),
+      outputChars: Number(row.output_chars),
+      inputTokens: row.input_tokens === null ? null : Number(row.input_tokens),
+      outputTokens: row.output_tokens === null ? null : Number(row.output_tokens),
+      durationMs: Number(row.duration_ms),
+      failover: JSON.parse(String(row.failover_json)) as DelegationRecord["failover"],
+      error: row.error === null ? null : String(row.error),
+      createdAt: String(row.created_at),
+    }));
+  }
+
+  delegationTotals(): {
+    count: number;
+    contextChars: number;
+    inputTokens: number;
+    outputTokens: number;
+  } {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count, COALESCE(SUM(context_chars), 0) AS context_chars,
+          COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens
+        FROM delegations WHERE error IS NULL`,
+      )
+      .get() as {
+      count: number;
+      context_chars: number;
+      input_tokens: number;
+      output_tokens: number;
+    };
+    return {
+      count: row.count,
+      contextChars: row.context_chars,
+      inputTokens: row.input_tokens,
+      outputTokens: row.output_tokens,
+    };
   }
 
   recordProviderCall(input: {

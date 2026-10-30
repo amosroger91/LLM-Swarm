@@ -37,11 +37,20 @@ const CliProviderSchema = z
   .object({
     type: z.literal("cli"),
     command: z.string().min(1),
+    model: z.string().min(1).max(200).optional(),
     fileEditing: z.boolean().optional(),
     args: z.array(z.string()).max(100),
     promptTransport: z.enum(["argv", "stdin", "file"]).default("argv"),
     outputParser: z
-      .enum(["text", "json", "fenced-json", "grok-json", "opencode-events", "gemini-json"])
+      .enum([
+        "text",
+        "json",
+        "fenced-json",
+        "grok-json",
+        "opencode-events",
+        "gemini-json",
+        "claude-json",
+      ])
       .default("fenced-json"),
     timeoutMs: z.number().int().positive().max(3_600_000).default(300_000),
     capabilities: CapabilitiesSchema,
@@ -80,6 +89,8 @@ const AgentSchema = z
   .object({
     role: z.enum(["planner", "worker", "reviewer"]),
     provider: z.string().min(1),
+    /** Providers tried in order when the primary is rate limited, down, or produces bad output. */
+    fallbacks: z.array(z.string().min(1)).max(10).default([]),
     systemPrompt: z.string().max(20_000).optional(),
   })
   .strict();
@@ -165,6 +176,25 @@ export const SwarmConfigSchema = z
         allowRemotePr: false,
       }),
     checks: z.array(CheckSchema).max(20).default([]),
+    delegate: z
+      .object({
+        /** Agent used by the delegate MCP tools. Defaults to the default profile's worker. */
+        agent: z.string().min(1).optional(),
+        maxInputChars: z.number().int().positive().max(2_000_000).default(120_000),
+        maxOutputChars: z.number().int().positive().max(200_000).default(12_000),
+        maxConcurrency: z.number().int().min(1).max(16).default(4),
+        maxFiles: z.number().int().min(1).max(2000).default(200),
+      })
+      .strict()
+      .prefault({}),
+    dashboard: z
+      .object({
+        port: z.number().int().min(0).max(65535).default(4317),
+        /** MCP starts a detached dashboard daemon when none is running, then proxies to it. */
+        autoStart: z.boolean().default(true),
+      })
+      .strict()
+      .prefault({}),
     providers: z.record(z.string(), ProviderConfigSchema).default({}),
     agents: z.record(z.string(), AgentSchema).default({}),
     profiles: z.record(z.string(), ProfileSchema).default({}),
@@ -182,13 +212,52 @@ export const SwarmConfigSchema = z
       });
     }
     for (const [name, agent] of Object.entries(config.agents)) {
-      if (!config.providers[agent.provider]) {
+      const primary = config.providers[agent.provider];
+      if (!primary) {
         ctx.addIssue({
           code: "custom",
           path: ["agents", name, "provider"],
           message: `Unknown provider ${agent.provider}`,
         });
       }
+      for (const [index, fallback] of agent.fallbacks.entries()) {
+        const candidate = config.providers[fallback];
+        if (!candidate) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["agents", name, "fallbacks", index],
+            message: `Unknown provider ${fallback}`,
+          });
+          continue;
+        }
+        if (fallback === agent.provider || agent.fallbacks.indexOf(fallback) !== index) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["agents", name, "fallbacks", index],
+            message: `Provider ${fallback} appears twice in the chain`,
+          });
+        }
+        // Planners and reviewers use one prompt contract for every provider. Workers get a
+        // prompt shaped by how they edit files, so a fallback must edit files the same way.
+        if (
+          primary &&
+          agent.role === "worker" &&
+          workerContract(primary) !== workerContract(candidate)
+        ) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["agents", name, "fallbacks", index],
+            message: `Worker fallback ${fallback} (${workerContract(candidate)}) does not match ${agent.provider} (${workerContract(primary)}). Use providers with the same type, toolCalling, structuredOutput, and fileEditing.`,
+          });
+        }
+      }
+    }
+    if (config.delegate.agent && !config.agents[config.delegate.agent]) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["delegate", "agent"],
+        message: `Unknown agent ${config.delegate.agent}`,
+      });
     }
     for (const [name, profile] of Object.entries(config.profiles)) {
       for (const key of ["planner", "worker", "reviewer"] as const) {
@@ -232,6 +301,19 @@ export type SwarmConfig = z.infer<typeof SwarmConfigSchema>;
 export type AgentConfig = z.infer<typeof AgentSchema>;
 export type ProfileConfig = z.infer<typeof ProfileSchema>;
 export type CheckConfig = z.infer<typeof CheckSchema>;
+
+/** How a worker on this provider receives and returns work. Fallbacks must match. */
+export function workerContract(provider: ProviderConfig): string {
+  const edits =
+    provider.type === "cli"
+      ? provider.fileEditing !== false
+        ? "edits-checkout"
+        : "returns-patch"
+      : provider.capabilities.toolCalling
+        ? "edits-with-tools"
+        : "returns-patch";
+  return `${edits}/${provider.capabilities.structuredOutput ? "json" : "text"}`;
+}
 
 export function workerCap(config: SwarmConfig): number {
   return config.allowWorkerCountAboveDefault

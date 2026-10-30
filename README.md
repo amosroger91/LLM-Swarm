@@ -1,6 +1,12 @@
 # LLM Swarm
 
-Local multi-agent orchestration for a software repo, exposed as an MCP server.
+Local multi-agent orchestration for a software repo, exposed as an MCP server and a web control center.
+
+Use a strong model (Claude Code) to plan and review, and local Ollama or free remote models to do the work, with automatic failover when a model is rate limited, out of quota, down, or produces bad output. From Claude Code, hand off whole features (`start_swarm`) or cheap one-off chores (`delegate`) so the expensive model spends its tokens on decisions instead of reading files.
+
+- [Using it from Claude Code](docs/claude-code.md): install, tools, and a `CLAUDE.md` snippet that teaches Claude when to delegate.
+- [Model routing and failover](docs/failover.md): fallback chains, cooldowns, and retry rotation.
+- `config/hybrid.yaml`: Claude Code plans/reviews; Ollama → Groq → Gemini → OpenRouter execute.
 
 ## Overview
 
@@ -28,13 +34,14 @@ The scheduler, store, and providers can run without the MCP transport. See [docs
 
 ## Quick start
 
-```powershell
+```sh
 npm install
 npm run build
-node dist/cli.js dashboard --config config/swarm.example.yaml
+node dist/cli.js providers --config config/hybrid.yaml   # ping every model once
+claude mcp add llm-swarm --scope user -- node "$PWD/dist/cli.js" mcp --config "$PWD/config/hybrid.yaml"
 ```
 
-Open `http://127.0.0.1:4317`. For MCP instead, use `npm run mcp -- --config config/swarm.example.yaml`. A database has one scheduler owner; run either the dashboard or an MCP scheduler against it.
+The first MCP connection starts a detached daemon that runs the scheduler and the web control center at `http://127.0.0.1:4317`; later Claude Code sessions attach to the same daemon, and jobs keep running after Claude exits. To run the web UI on its own: `node dist/cli.js dashboard --config config/hybrid.yaml`. A database has one scheduler owner; MCP processes find a running dashboard through `<dataDir>/dashboard.json` and act as its clients (`mcp --in-process` opts out).
 
 Point an MCP client at `node dist/cli.js mcp --config config/swarm.example.yaml` after a build. Configure `checks` for the target repository before starting an implementation job. Checks are required by default; a deliberately unverified experiment can set `requireChecks: false`. With no config file and no `SWARM_CONFIG` variable, the process uses the built-in Ollama profile at `http://127.0.0.1:11434/v1`.
 
@@ -51,13 +58,16 @@ npx tsx src/cli.ts status <job_id> --config config/swarm.example.yaml
 
 Secrets are read from the environment. The database, config, and logs store the variable name, not the value.
 
-| Variable         | Required | Description                                                           |
-| ---------------- | -------- | --------------------------------------------------------------------- |
-| `OLLAMA_API_KEY` | optional | Sent only when set. The sample Ollama provider works with no key.     |
-| `OPENAI_API_KEY` | optional | For an OpenAI-compatible provider that names this variable.           |
-| `XAI_API_KEY`    | optional | Passed to the grok CLI only when that profile's `envPass` lists it.   |
-| `GEMINI_API_KEY` | optional | Passed to the gemini CLI only when that profile's `envPass` lists it. |
-| `SWARM_CONFIG`   | optional | Path to a YAML config. `--config` wins over this variable.            |
+| Variable             | Required | Description                                                                   |
+| -------------------- | -------- | ----------------------------------------------------------------------------- |
+| `OLLAMA_API_KEY`     | optional | Sent only when set. The sample Ollama provider works with no key.             |
+| `OPENAI_API_KEY`     | optional | For an OpenAI-compatible provider that names this variable.                   |
+| `XAI_API_KEY`        | optional | Passed to the grok CLI only when that profile's `envPass` lists it.           |
+| `GEMINI_API_KEY`     | optional | Gemini API failover in `hybrid.yaml`; the gemini CLI when `envPass` lists it. |
+| `GROQ_API_KEY`       | optional | Groq free-tier failover in `hybrid.yaml`.                                     |
+| `OPENROUTER_API_KEY` | optional | OpenRouter free models in `hybrid.yaml`.                                      |
+| `ANTHROPIC_API_KEY`  | optional | Claude Code planner; without it `claude` uses its own login.                  |
+| `SWARM_CONFIG`       | optional | Path to a YAML config. `--config` wins over this variable.                    |
 
 `.env.example` lists supported variables. Set them in the process environment; the app does not automatically load `.env`. Node's `--env-file` option can load a local file when starting the built CLI. Provider and profile fields are documented in [docs/configuration.md](docs/configuration.md).
 
@@ -67,8 +77,13 @@ Secrets are read from the environment. The database, config, and logs store the 
 
 | Tool              | What it does                                                                                                                                                      |
 | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `delegate`        | Runs one bounded task on the cheap delegate agent. It reads the given files/globs itself and returns only its answer plus a one-line provenance footer.           |
+| `delegate_map`    | Runs a task per file in parallel, optionally merging the answers with `reduce`.                                                                                   |
+| `swarm_wait`      | Blocks until a job finishes or needs an answer (or the timeout passes) and returns compact status. Replaces polling.                                              |
+| `swarm_jobs`      | Recent jobs with task counts.                                                                                                                                     |
+| `swarm_providers` | Provider health, cooldowns, failover chains, and delegation totals.                                                                                               |
 | `start_swarm`     | Persists a job and returns `{ job_id, status }` without waiting for the swarm to finish. Optional `base_branch`, `worker_count`, `config_profile`, and `dry_run`. |
-| `swarm_status`    | Job status, task counts, active workers, recent events, review state.                                                                                             |
+| `swarm_status`    | Compact job status: task counts, active workers, open blockers and questions, token totals. `verbose: true` adds the full call log and blocker evidence.          |
 | `swarm_chat`      | Appends a message to the job chat room.                                                                                                                           |
 | `swarm_decisions` | Lists decisions, options, votes, and rationale.                                                                                                                   |
 | `swarm_vote`      | Records or replaces the caller's vote. Default voter is `mcp-client`.                                                                                             |
@@ -77,20 +92,22 @@ Secrets are read from the environment. The database, config, and logs store the 
 
 `dry_run` stores the plan and does not launch workers or change git.
 
-Additional tools are `resume_swarm`, `launch_swarm_plan`, `swarm_blockers`, `resolve_swarm_decision`, `swarm_planner_chat`, `apply_swarm_proposal`, and `swarm_maintenance`. Native API workers with `toolCalling` enabled can read source, edit assigned files, run configured checks, exchange live messages, and request help. Planner task additions validate the combined dependency graph and file ownership.
+`resume_swarm`, `launch_swarm_plan`, and `resolve_swarm_decision` are also in the default `core` toolset. `mcp --tools all` adds `swarm_chat`, `swarm_decisions`, `swarm_vote`, `swarm_blockers`, `swarm_planner_chat`, `apply_swarm_proposal`, and `swarm_maintenance`; the smaller default keeps tool definitions from crowding the caller's context. Tool results are compact JSON. Native API workers with `toolCalling` enabled can read source, edit assigned files, run configured checks, exchange live messages, and request help. Planner task additions validate the combined dependency graph and file ownership.
 
 ### CLI
 
-| Command             | What it does                                         |
-| ------------------- | ---------------------------------------------------- |
-| `mcp`               | MCP server on stdio. Diagnostics go to stderr.       |
-| `migrate`           | Opens the database and applies migrations.           |
-| `jobs`              | Prints recent jobs as JSON.                          |
-| `status <job_id>`   | Prints one job's status.                             |
-| `result <job_id>`   | Prints the final report, or an in-progress response. |
-| `cancel <job_id>`   | Requests cancellation.                               |
-| `snapshot <job_id>` | Regenerates `swarm.md`.                              |
-| `backup <file>`     | Copies the SQLite database.                          |
+| Command             | What it does                                                                     |
+| ------------------- | -------------------------------------------------------------------------------- |
+| `mcp`               | MCP server on stdio; attaches to or starts the daemon. Diagnostics go to stderr. |
+| `dashboard [port]`  | Web control center plus scheduler (the daemon).                                  |
+| `providers`         | Sends a one-word prompt to every provider and reports which work.                |
+| `migrate`           | Opens the database and applies migrations.                                       |
+| `jobs`              | Prints recent jobs as JSON.                                                      |
+| `status <job_id>`   | Prints one job's status.                                                         |
+| `result <job_id>`   | Prints the final report, or an in-progress response.                             |
+| `cancel <job_id>`   | Requests cancellation.                                                           |
+| `snapshot <job_id>` | Regenerates `swarm.md`.                                                          |
+| `backup <file>`     | Copies the SQLite database.                                                      |
 
 ## Project structure
 
@@ -99,10 +116,13 @@ src/cli.ts                 local CLI
 src/mcp/server.ts          MCP tools
 src/orchestration/         planner validation, scheduler, prompts, snapshots
 src/db/                    SQLite connection, migrations, store
-src/providers/             OpenAI-compatible and CLI adapters
+src/providers/             OpenAI-compatible and CLI adapters, failover chains, provider health
+src/orchestration/delegate.ts  delegate / delegate_map
+src/mcp/backend.ts         in-process or daemon-backed tool backend
 src/git/workspace.ts       worktrees, or an in-memory workspace for tests
 src/safety/                paths, process spawn, redaction, remote-git policy
 config/swarm.example.yaml  Ollama default plus help-checked CLI profiles
+config/hybrid.yaml         Claude Code planner/reviewer, Ollama + free-tier workers with failover
 test/                      Vitest suite, no network and no real agent CLIs
 ```
 

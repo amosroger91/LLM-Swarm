@@ -1,5 +1,8 @@
 #!/usr/bin/env node
+import { spawn } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { databasePath, loadConfig } from "./config/load.js";
 import { openDatabase } from "./db/connection.js";
 import { Store } from "./db/store.js";
@@ -16,35 +19,150 @@ import { renderSnapshot, writeSnapshotAtomic } from "./orchestration/snapshot.js
 import { createRedactor, secretValuesFromEnv } from "./safety/redact.js";
 import { SwarmError, errorMessage } from "./errors.js";
 import { startDashboard } from "./web/server.js";
+import {
+  probeDashboard,
+  readDashboardInfo,
+  remoteBackend,
+  removeDashboardInfo,
+  type DashboardInfo,
+} from "./mcp/backend.js";
+import type { Toolset } from "./mcp/server.js";
+import type { SwarmConfig } from "./config/schema.js";
+import { createProvider } from "./providers/registry.js";
 
 interface ParsedArgs {
   command: string;
   positionals: string[];
   config?: string;
+  tools: Toolset;
+  inProcess: boolean;
+  anyPort: boolean;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
   const positionals: string[] = [];
   let config: string | undefined;
+  let tools: Toolset = "core";
+  let inProcess = false;
+  let anyPort = false;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (arg === "--config") {
+    if (arg === "--config" || arg === "--tools") {
       const value = argv[index + 1];
-      if (!value) throw new SwarmError("--config requires a file path", "bad_args");
-      config = value;
+      if (!value) throw new SwarmError(`${arg} requires a value`, "bad_args");
+      if (arg === "--config") config = value;
+      else if (value === "core" || value === "all") tools = value;
+      else throw new SwarmError("--tools must be core or all", "bad_args");
       index += 1;
+      continue;
+    }
+    if (arg === "--in-process") {
+      inProcess = true;
+      continue;
+    }
+    if (arg === "--any-port") {
+      anyPort = true;
       continue;
     }
     if (arg) positionals.push(arg);
   }
-  return { command: positionals[0] ?? "help", positionals: positionals.slice(1), config };
+  return {
+    command: positionals[0] ?? "help",
+    positionals: positionals.slice(1),
+    config,
+    tools,
+    inProcess,
+    anyPort,
+  };
+}
+
+/** Every API key variable the config names, so their values never reach logs. */
+function secretNames(config: SwarmConfig): string[] {
+  const names = new Set(["OLLAMA_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "GEMINI_API_KEY"]);
+  for (const provider of Object.values(config.providers)) {
+    if (provider.type === "openai_compatible" && provider.apiKeyEnv) names.add(provider.apiKeyEnv);
+    if (provider.type === "cli") for (const name of provider.envPass) names.add(name);
+  }
+  return [...names];
+}
+
+/**
+ * Find the long-lived dashboard daemon that owns the scheduler, starting one if needed.
+ * Jobs then survive the MCP client exiting, and several Claude Code sessions plus the web UI
+ * share one scheduler.
+ */
+async function connectDaemon(
+  config: SwarmConfig,
+  args: ParsedArgs,
+): Promise<DashboardInfo | undefined> {
+  if (args.inProcess) return undefined;
+  const existing = readDashboardInfo(config.dataDir);
+  if (existing && (await probeDashboard(existing))) return existing;
+  if (!config.dashboard.autoStart) return undefined;
+  const configPath = args.config ?? process.env.SWARM_CONFIG;
+  fs.mkdirSync(path.resolve(config.dataDir), { recursive: true });
+  const log = fs.openSync(path.join(path.resolve(config.dataDir), "daemon.log"), "a");
+  const child = spawn(
+    process.execPath,
+    [
+      ...process.execArgv,
+      process.argv[1]!,
+      "dashboard",
+      String(config.dashboard.port),
+      "--any-port",
+      ...(configPath ? ["--config", path.resolve(configPath)] : []),
+    ],
+    { detached: true, stdio: ["ignore", log, log], env: process.env, windowsHide: true },
+  );
+  fs.closeSync(log);
+  let exited = false;
+  child.once("exit", () => (exited = true));
+  child.unref();
+  for (let waited = 0; waited < 20_000 && !exited; waited += 250) {
+    await delay(250);
+    const info = readDashboardInfo(config.dataDir);
+    if (info && info.pid === child.pid && (await probeDashboard(info))) return info;
+  }
+  return undefined;
+}
+
+async function pingProviders(config: SwarmConfig, redact: (text: string) => string) {
+  return Promise.all(
+    Object.entries(config.providers).map(async ([name, provider]) => {
+      const started = Date.now();
+      try {
+        const response = await createProvider(name, provider, redact).complete({
+          prompt: "Reply with the single word OK.",
+          timeoutMs: Math.min(60_000, config.providerTimeoutMs),
+          signal: AbortSignal.timeout(Math.min(90_000, config.providerTimeoutMs)),
+        });
+        return {
+          provider: name,
+          ok: true,
+          model: response.model ?? null,
+          ms: Date.now() - started,
+          reply: response.text.trim().slice(0, 40),
+        };
+      } catch (error) {
+        return {
+          provider: name,
+          ok: false,
+          ms: Date.now() - started,
+          error: redact(errorMessage(error)).slice(0, 300),
+        };
+      }
+    }),
+  );
 }
 
 function help(): string {
   return `llm-swarm <command> [--config file]
 
 Commands:
-  mcp                Start the MCP server on stdio
+  mcp                Start the MCP server on stdio. Attaches to (or starts) the dashboard
+                     daemon so jobs outlive the client. --in-process skips the daemon;
+                     --tools all exposes chat/vote/planner tools (default: core)
+  providers          Send a one-word prompt to every configured provider and report health
   dashboard [port]   Start the local web control center (default 4317)
   maintenance       Run one recovery/question-answering sweep
   watchdog [port]   Restore the dashboard and resume interrupted work; no-op if a live scheduler exists
@@ -71,10 +189,22 @@ async function main(): Promise<void> {
     return;
   }
   const config = loadConfig(args.config);
-  const redact = createRedactor(
-    secretValuesFromEnv(["OLLAMA_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "GEMINI_API_KEY"]),
-  );
+  const redact = createRedactor(secretValuesFromEnv(secretNames(config)));
   const logger = createLogger(config.logLevel, redact);
+  if (args.command === "providers") {
+    const results = await pingProviders(config, redact);
+    process.stdout.write(`${JSON.stringify(results, null, 2)}\n`);
+    if (results.some((result) => !result.ok)) process.exitCode = 1;
+    return;
+  }
+  if (args.command === "mcp") {
+    const daemon = await connectDaemon(config, args);
+    if (daemon) {
+      logger.info({ url: daemon.url }, "MCP attached to swarm daemon");
+      serveSwarm(remoteBackend(daemon), logger, { tools: args.tools });
+      return;
+    }
+  }
   const db = openDatabase(databasePath(config));
   const store = new Store(db);
   if (args.command === "migrate") {
@@ -196,7 +326,9 @@ async function main(): Promise<void> {
     const port = Number(args.positionals[0] ?? 4317);
     if (!Number.isInteger(port) || port < 0 || port > 65535)
       throw new SwarmError("Invalid dashboard port", "bad_args");
-    const { server, url } = await startDashboard(store, orchestrator, config, port);
+    const { server, url } = await startDashboard(store, orchestrator, config, port, {
+      anyPort: args.anyPort,
+    });
     process.stdout.write(`Swarm control center: ${url}\n`);
     if (args.command === "watchdog")
       void orchestrator
@@ -205,6 +337,7 @@ async function main(): Promise<void> {
           logger.error({ error: errorMessage(error) }, "initial watchdog recovery failed"),
         );
     const stop = (): void => {
+      removeDashboardInfo(config.dataDir);
       server.close();
       void orchestrator.shutdown().finally(() => {
         store.close();
@@ -239,7 +372,7 @@ async function main(): Promise<void> {
     };
     process.on("SIGINT", stop);
     process.on("SIGTERM", stop);
-    serveSwarm(orchestrator, logger);
+    serveSwarm(orchestrator, logger, { tools: args.tools });
     return;
   }
   store.close();

@@ -273,6 +273,7 @@ export class OpenAICompatibleProvider implements AgentProvider {
         `OpenAI-compatible provider returned HTTP ${response.status}: ${redacted}`,
         "http",
         response.status >= 500 || response.status === 429,
+        { status: response.status, retryAfterMs: parseRetryAfter(response.headers) },
       );
     }
     let parsedJson: unknown;
@@ -384,6 +385,15 @@ export class OpenAICompatibleProvider implements AgentProvider {
     }
     return value;
   }
+}
+
+export function parseRetryAfter(headers: Headers): number | undefined {
+  const value = headers.get("retry-after");
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - Date.now());
 }
 
 export function redactorForKey(key: string | undefined): (text: string) => string {

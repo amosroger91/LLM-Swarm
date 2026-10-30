@@ -11,6 +11,7 @@ import type { AgentProvider, ProviderRequest, ProviderResponse } from "./types.j
 
 export class CliProvider implements AgentProvider {
   readonly name: string;
+  readonly model: string;
   readonly capabilities: CliProviderConfig["capabilities"];
   private readonly executable: string;
 
@@ -20,6 +21,7 @@ export class CliProvider implements AgentProvider {
     private readonly redact: (text: string) => string = (text) => text,
   ) {
     this.name = providerName;
+    this.model = config.model ?? config.command;
     this.capabilities = config.capabilities;
     try {
       this.executable = resolveExecutable(config.command);
@@ -47,6 +49,7 @@ export class CliProvider implements AgentProvider {
       prompt: transport === "argv" ? prompt : "",
       promptFile,
       cwd,
+      model: this.config.model,
     });
     const { env, secrets } = allowlistedEnv(this.config.envPass);
     const redact = (text: string) =>
@@ -80,7 +83,7 @@ export class CliProvider implements AgentProvider {
       }
       if (result.code !== 0) {
         throw new SwarmError(
-          `CLI provider ${this.providerName} exited ${result.code}: ${redact(result.stderr).slice(0, 2000)}`,
+          `CLI provider ${this.providerName} exited ${result.code}: ${redact(`${result.stderr}\n${result.stdout.slice(-2000)}`.trim()).slice(0, 2000)}`,
           "exit",
           true,
         );
@@ -89,13 +92,14 @@ export class CliProvider implements AgentProvider {
       const response: ProviderResponse = {
         text: parsed.text,
         provider: this.providerName,
-        model: this.config.command,
+        model: parsed.model ?? this.config.model ?? this.config.command,
       };
+      if (parsed.usage) response.usage = parsed.usage;
       if (parsed.structured !== undefined) response.structured = parsed.structured;
       return response;
     } catch (error) {
       if (error instanceof SwarmError) {
-        throw new SwarmError(redact(error.message), error.code, error.retryable);
+        throw new SwarmError(redact(error.message), error.code, error.retryable, error.details);
       }
       throw new SwarmError(redact(errorMessage(error)), "spawn", true);
     } finally {
@@ -106,9 +110,13 @@ export class CliProvider implements AgentProvider {
 
 export function buildArgs(
   template: readonly string[],
-  values: { prompt: string; promptFile?: string; cwd: string },
+  values: { prompt: string; promptFile?: string; cwd: string; model?: string },
 ): string[] {
   return template.map((part) => {
+    if (part === "{model}") {
+      if (!values.model) throw new SwarmError("Argument {model} requires model", "bad_config");
+      return values.model;
+    }
     if (part === "{prompt}") return values.prompt;
     if (part === "{promptFile}") {
       if (!values.promptFile) {

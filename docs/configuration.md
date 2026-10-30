@@ -6,7 +6,7 @@ Load order:
 2. `SWARM_CONFIG`
 3. Built-in default, which matches the Ollama profile in `config/swarm.example.yaml`
 
-`dataDir` and `database` are resolved relative to the config file. Without a file, `dataDir` is `.swarm-data` under the process working directory. The database path is `database` or `<dataDir>/swarm.db`.
+`dataDir` and `database` are resolved relative to the config file, and a leading `~/` means your home directory. Pointing every project's config at one `dataDir` (as `config/hybrid.yaml` does with `~/.llm-swarm`) gives you one daemon, one dashboard, and one job history for all of them. Without a file, `dataDir` is `.swarm-data` under the process working directory. The database path is `database` or `<dataDir>/swarm.db`.
 
 `dataDir` stores SQLite and snapshots. Agent worktrees live under `<repo_path>/workspaces/<job-id>/` independently of `dataDir`. Keep the data directory ignored if it is inside the target repository. See [workspaces.md](workspaces.md) for tool exclusions and retention.
 
@@ -35,7 +35,9 @@ capabilities:
 
 Tool workers operate in bounded turns with scoped file access, configured checks, coordination tools, and explicit help requests. `providerTimeoutMs` bounds an HTTP request, `agentTimeoutMs` bounds the complete tool turn, and `jobTimeoutMs` bounds the job. Roles can already use different providers/models through their agent profiles. See [supervision](supervision.md) for recovery and maintenance limits.
 
-`cli` fields: `command`, `args`, `promptTransport` (`argv`, `stdin`, or `file`), `outputParser`, `timeoutMs`, `capabilities`, `envPass`, `maxStdoutBytes`, `documentedStatus`, `notes`, and optional `fileEditing`.
+`cli` fields: `command`, `args`, `promptTransport` (`argv`, `stdin`, or `file`), `outputParser`, `timeoutMs`, `capabilities`, `envPass`, `maxStdoutBytes`, `documentedStatus`, `notes`, and optional `fileEditing` and `model`. An argument of exactly `{model}` is replaced with `model`.
+
+The `claude-json` parser reads Claude Code's `claude -p --output-format json` envelope: the answer, token usage (including cache reads), and `is_error` results such as usage limits, which failover treats as exhaustion. See the `claude` provider in `config/hybrid.yaml`.
 
 Set `fileEditing: false` for a read-only CLI that returns patches from supplied context. Workers then receive the patch-only contract; the coordinator validates ownership, applies the diff, and runs required checks. The default preserves CLI workers that edit their own worktree directly. This describes the provider's capabilities and does not change its sandbox or command policy.
 
@@ -59,9 +61,25 @@ On Windows, `opencode` from npm is often `opencode.ps1`. The adapter rejects `.p
 
 ## Agents and profiles
 
-An agent has a `role` (`planner`, `worker`, or `reviewer`) and a `provider` name. A profile points at one agent of each role. The role on the agent must match the slot. `workerCount` on a profile cannot exceed the cap.
+An agent has a `role` (`planner`, `worker`, or `reviewer`), a `provider` name, and optional `fallbacks`: provider names tried in order when the primary is rate limited, out of quota, down, or returns unusable output. Worker fallbacks must edit files the same way as the primary. See [failover.md](failover.md). A profile points at one agent of each role. The role on the agent must match the slot. `workerCount` on a profile cannot exceed the cap.
 
 `start_swarm`'s `config_profile` selects a profile. `worker_count` overrides the profile count when it is present.
+
+## Delegation and the daemon
+
+```yaml
+delegate:
+  agent: delegate # any agent; defaults to the default profile's worker
+  maxInputChars: 120000 # larger requests are refused; use delegate_map
+  maxOutputChars: 12000
+  maxConcurrency: 4 # parallel calls in delegate_map
+  maxFiles: 200
+dashboard:
+  port: 4317
+  autoStart: true # `mcp` starts a detached dashboard daemon when none is running
+```
+
+The `mcp` command first looks for `<dataDir>/dashboard.json` written by a live dashboard and proxies every tool call to it. If there is none and `autoStart` is on, it starts `dashboard` as a detached process (log: `<dataDir>/daemon.log`; if the port is taken it picks a free one) and attaches. With `autoStart: false`, or `mcp --in-process`, the MCP process runs its own scheduler as before. See [claude-code.md](claude-code.md).
 
 ## Decisions, git, and checks
 

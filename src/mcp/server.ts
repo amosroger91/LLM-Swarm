@@ -1,9 +1,20 @@
+import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 import { SwarmError, errorMessage } from "../errors.js";
-import type { Orchestrator } from "../orchestration/service.js";
+import type { DelegateMapResult, DelegateResult } from "../orchestration/delegate.js";
 import { createLogger, type Logger } from "../logging/logger.js";
+import type { SwarmBackend } from "./backend.js";
+
+export type Toolset = "core" | "all";
+
+export interface SwarmServerOptions {
+  /** core: the tools needed to offload and track work. all: adds chat, votes, and planner tools. */
+  tools?: Toolset;
+  /** Directory relative paths resolve against. Defaults to this process's working directory. */
+  cwd?: string;
+}
 
 const StartInput = z.object({
   task: z.string().min(1).max(20_000).describe("High-level task for the swarm"),
@@ -60,10 +71,59 @@ const VoteInput = z.object({
     ),
 });
 
+// Compact JSON: tool output lands in the caller's context window, so every byte is a token.
 function ok(data: Record<string, unknown>) {
   return {
-    content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
+    content: [{ type: "text" as const, text: JSON.stringify(data) }],
     structuredContent: data,
+  };
+}
+
+function text(value: string) {
+  return { content: [{ type: "text" as const, text: value }] };
+}
+
+function footer(result: DelegateResult): string {
+  const tokens =
+    result.inputTokens !== undefined
+      ? ` ${result.inputTokens}+${result.outputTokens ?? 0} tok`
+      : "";
+  const failover = result.failover?.length
+    ? ` after ${result.failover.map((item) => `${item.provider}:${item.kind}`).join(",")}`
+    : "";
+  return `\n\n[${result.provider}${result.model ? `/${result.model}` : ""}${failover} · ${result.files} files · ${Math.round(result.durationMs / 1000)}s${tokens}${result.truncated ? " · clipped" : ""}]`;
+}
+
+function renderMap(result: DelegateMapResult): string {
+  const body = result.reduced
+    ? result.reduced.text
+    : result.results.map((item) => `## ${item.file}\n${item.text}`).join("\n\n");
+  const failures = result.reduced
+    ? result.results.filter((item) => !item.ok).map((item) => `- ${item.file}: ${item.text}`)
+    : [];
+  return `${body}${failures.length ? `\n\nFailed:\n${failures.join("\n")}` : ""}\n\n[${result.files} files · ${result.failed} failed · ${Math.round(result.durationMs / 1000)}s · ${result.inputTokens}+${result.outputTokens} tok]`;
+}
+
+/** Status without the full call log and blocker evidence. Ask with verbose for everything. */
+export function compactStatus(full: Record<string, unknown>): Record<string, unknown> {
+  const measurements = { ...(full.measurements as Record<string, unknown>) };
+  delete measurements.calls;
+  const blockers = (full.blockers as Array<Record<string, unknown>>)
+    .filter((blocker) => blocker.status !== "resolved")
+    .map((blocker) => ({
+      id: blocker.id,
+      category: blocker.category,
+      summary: String(blocker.summary).slice(0, 300),
+      next_action: String(blocker.nextAction).slice(0, 300),
+      occurrences: blocker.occurrences,
+    }));
+  return {
+    ...full,
+    recent_events: (full.recent_events as Array<Record<string, unknown>>)
+      .slice(-6)
+      .map((event) => ({ type: event.type, at: event.at })),
+    measurements,
+    blockers,
   };
 }
 
@@ -75,8 +135,175 @@ function fail(error: unknown) {
   };
 }
 
-export function createSwarmServer(orchestrator: Orchestrator): McpServer {
-  const server = new McpServer({ name: "llm-swarm", version: "1.0.0" });
+const DelegateBase = {
+  task: z
+    .string()
+    .min(1)
+    .max(40_000)
+    .describe("What to do. Be specific about the output you want; the answer is all you get back."),
+  root: z
+    .string()
+    .optional()
+    .describe("Directory files resolve against. Defaults to the current project."),
+  agent: z
+    .string()
+    .optional()
+    .describe("Agent name from the swarm config. Defaults to the cheap delegate agent."),
+  format: z.enum(["text", "json"]).optional(),
+  max_output_chars: z.number().int().positive().max(200_000).optional(),
+};
+
+export function createSwarmServer(
+  backend: SwarmBackend,
+  options: SwarmServerOptions = {},
+): McpServer {
+  const orchestrator = backend;
+  const all = (options.tools ?? "all") === "all";
+  const cwd = options.cwd ?? process.cwd();
+  const server = new McpServer({ name: "llm-swarm", version: "1.1.0" });
+  // Each advertised tool costs the caller context on every turn; the core set omits
+  // tools the dashboard covers better.
+  const extras: Array<{ remove(): void }> = [];
+  const register = server.registerTool.bind(server);
+  server.registerTool = ((name: string, ...rest: unknown[]) => {
+    const tool = (register as (...args: unknown[]) => { remove(): void })(name, ...rest);
+    if (!CORE_TOOLS.has(name)) extras.push(tool);
+    return tool;
+  }) as typeof server.registerTool;
+
+  server.registerTool(
+    "delegate",
+    {
+      title: "Delegate to a cheap model",
+      description:
+        "Offload a self-contained task to a local/free model and get back only its answer. The model reads the files, so you don't. Good for: summarizing or searching files, explaining code, drafting boilerplate/tests/docs, reviewing a diff, extracting data. Verify anything you act on.",
+      inputSchema: z.object({
+        ...DelegateBase,
+        files: z
+          .array(z.string().min(1))
+          .max(500)
+          .optional()
+          .describe(
+            "Paths, directories, or globs (src/**/*.ts) under root, sent with line numbers.",
+          ),
+        context: z
+          .string()
+          .max(200_000)
+          .optional()
+          .describe("Extra inline text, e.g. a diff or log."),
+      }),
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async (args) => {
+      try {
+        const result = await orchestrator.delegate({
+          task: args.task,
+          root: path.resolve(cwd, args.root ?? "."),
+          files: args.files,
+          context: args.context,
+          agent: args.agent,
+          format: args.format,
+          maxOutputChars: args.max_output_chars,
+        });
+        return text(result.text + footer(result));
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "delegate_map",
+    {
+      title: "Delegate per file",
+      description:
+        "Run the same task on each matched file in parallel on cheap models, optionally combining the answers with a final 'reduce' instruction. Use for large file sets that don't fit one delegate call.",
+      inputSchema: z.object({
+        ...DelegateBase,
+        files: z.array(z.string().min(1)).min(1).max(500).describe("Paths, directories, or globs"),
+        reduce: z
+          .string()
+          .max(20_000)
+          .optional()
+          .describe("Instruction to merge all per-file answers into one result"),
+      }),
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async (args) => {
+      try {
+        const result = await orchestrator.delegateMap({
+          task: args.task,
+          root: path.resolve(cwd, args.root ?? "."),
+          files: args.files,
+          agent: args.agent,
+          format: args.format,
+          maxOutputChars: args.max_output_chars,
+          reduce: args.reduce,
+        });
+        return text(renderMap(result));
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "swarm_wait",
+    {
+      title: "Wait for a job",
+      description:
+        "Block until a job finishes, needs an answer, or timeout_s passes, then return compact status. Use instead of polling swarm_status.",
+      inputSchema: z.object({
+        job_id: z.string().min(1),
+        timeout_s: z.number().int().min(1).max(3600).optional().describe("Default 300"),
+      }),
+    },
+    async ({ job_id, timeout_s }) => {
+      try {
+        const waited = await orchestrator.wait(job_id, (timeout_s ?? 300) * 1000);
+        const status = compactStatus(await orchestrator.status(job_id));
+        return ok({ ...waited, ...status });
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "swarm_jobs",
+    {
+      title: "List jobs",
+      description: "Recent swarm jobs with status and task counts.",
+      inputSchema: z.object({ limit: z.number().int().min(1).max(100).optional() }),
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ limit }) => {
+      try {
+        return ok({ jobs: await orchestrator.jobs(limit ?? 10) });
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "swarm_providers",
+    {
+      title: "Provider health",
+      description:
+        "Which models are healthy, cooling down after rate limits, or unavailable, plus each agent's failover chain and delegation totals.",
+      inputSchema: z.object({}),
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async () => {
+      try {
+        return ok(await orchestrator.providersView());
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
   server.registerTool(
     "launch_swarm_plan",
     {
@@ -160,7 +387,7 @@ export function createSwarmServer(orchestrator: Orchestrator): McpServer {
     },
     async ({ job_id }) => {
       try {
-        return ok({ blockers: orchestrator.status(job_id).blockers });
+        return ok({ blockers: (await orchestrator.status(job_id)).blockers as unknown[] });
       } catch (error) {
         return fail(error);
       }
@@ -201,7 +428,7 @@ export function createSwarmServer(orchestrator: Orchestrator): McpServer {
     async (args) => {
       try {
         return ok(
-          orchestrator.resolveDecision({
+          await orchestrator.resolveDecision({
             jobId: args.job_id,
             decisionId: args.decision_id,
             option: args.option,
@@ -228,7 +455,7 @@ export function createSwarmServer(orchestrator: Orchestrator): McpServer {
       try {
         const started = await orchestrator.startJob({
           task: args.task,
-          repoPath: args.repo_path,
+          repoPath: path.resolve(cwd, args.repo_path),
           baseBranch: args.base_branch,
           workerCount: args.worker_count,
           configProfile: args.config_profile,
@@ -247,8 +474,8 @@ export function createSwarmServer(orchestrator: Orchestrator): McpServer {
     {
       title: "Swarm status",
       description:
-        "Return job status, task counts, active workers, recent events, and review state.",
-      inputSchema: JobIdInput,
+        "Job status, task counts, active workers, open blockers and questions, token totals. Set verbose for the full call log and blocker evidence.",
+      inputSchema: JobIdInput.extend({ verbose: z.boolean().optional() }),
       outputSchema: z.object({
         job_id: z.string(),
         status: z.string(),
@@ -266,9 +493,10 @@ export function createSwarmServer(orchestrator: Orchestrator): McpServer {
       }),
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async ({ job_id }) => {
+    async ({ job_id, verbose }) => {
       try {
-        return ok(orchestrator.status(job_id));
+        const status = await orchestrator.status(job_id);
+        return ok(verbose ? status : compactStatus(status));
       } catch (error) {
         return fail(error);
       }
@@ -287,7 +515,7 @@ export function createSwarmServer(orchestrator: Orchestrator): McpServer {
     async (args) => {
       try {
         return ok(
-          orchestrator.chat({
+          await orchestrator.chat({
             jobId: args.job_id,
             message: args.message,
             channel: args.channel,
@@ -310,7 +538,7 @@ export function createSwarmServer(orchestrator: Orchestrator): McpServer {
     },
     async ({ job_id }) => {
       try {
-        const decisions = orchestrator.decisions(job_id);
+        const decisions = await orchestrator.decisions(job_id);
         return ok({ decisions: decisions as Record<string, unknown>[] });
       } catch (error) {
         return fail(error);
@@ -335,7 +563,7 @@ export function createSwarmServer(orchestrator: Orchestrator): McpServer {
     async (args) => {
       try {
         return ok(
-          orchestrator.vote({
+          await orchestrator.vote({
             jobId: args.job_id,
             decisionId: args.decision_id,
             option: args.option,
@@ -368,7 +596,7 @@ export function createSwarmServer(orchestrator: Orchestrator): McpServer {
     },
     async ({ job_id }) => {
       try {
-        return ok(orchestrator.result(job_id));
+        return ok(await orchestrator.result(job_id));
       } catch (error) {
         return fail(error);
       }
@@ -391,21 +619,39 @@ export function createSwarmServer(orchestrator: Orchestrator): McpServer {
     },
     async ({ job_id }) => {
       try {
-        return ok(orchestrator.cancel(job_id));
+        return ok(await orchestrator.cancel(job_id));
       } catch (error) {
         return fail(error);
       }
     },
   );
 
+  server.registerTool = register;
+  if (!all) for (const tool of extras) tool.remove();
   return server;
 }
 
+export const CORE_TOOLS = new Set([
+  "delegate",
+  "delegate_map",
+  "start_swarm",
+  "swarm_wait",
+  "swarm_status",
+  "swarm_result",
+  "swarm_jobs",
+  "swarm_providers",
+  "cancel_swarm",
+  "resume_swarm",
+  "launch_swarm_plan",
+  "resolve_swarm_decision",
+]);
+
 export function serveSwarm(
-  orchestrator: Orchestrator,
+  backend: SwarmBackend,
   logger: Logger = createLogger("info", (text) => text),
+  options: SwarmServerOptions = {},
 ): void {
-  serveStdio(() => createSwarmServer(orchestrator), {
+  serveStdio(() => createSwarmServer(backend, options), {
     onerror(error) {
       logger.error({ err: error.message }, "mcp transport error");
     },

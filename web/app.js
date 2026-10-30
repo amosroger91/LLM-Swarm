@@ -29,7 +29,9 @@ const badge = (status) =>
 const icon = (name) => ({ tasks: "▤", workers: "◈", blockers: "⚑", tokens: "⌁" })[name] ?? "·";
 let state,
   detail,
-  selected = location.hash.slice(1),
+  providers,
+  view = location.hash === "#models" ? "models" : "mission",
+  selected = location.hash === "#models" ? "" : location.hash.slice(1),
   tab = "overview",
   refreshing = false,
   chatting = false;
@@ -61,6 +63,7 @@ function jobUrl(action) {
   return `/api/jobs/${encodeURIComponent(selected)}${action ? `/${action}` : ""}`;
 }
 function choose(id) {
+  view = "mission";
   selected = id;
   location.hash = id;
   detail = undefined;
@@ -203,6 +206,36 @@ function renderMission() {
         .join("")}</section>`,
     );
 }
+function healthBadge(state) {
+  return badge(
+    state === "healthy" ? "healthy" : state === "cooling" ? "cooling_down" : "unavailable",
+  );
+}
+function renderModels() {
+  if (!providers) return;
+  $("#project-name").textContent = "Models & routing";
+  const totals = providers.delegate.totals;
+  const rows = providers.providers
+    .map(
+      (item) =>
+        `<article class="artifact"><div><strong>${escape(item.name)}</strong> <span class="muted">${escape(item.type)} · ${escape(item.model ?? "")}</span> ${healthBadge(item.state)}</div><p>${item.calls} calls · ${item.failures} failures · ${compact(item.inputTokens + item.outputTokens)} tokens${item.availableAt ? ` · back at ${date(item.availableAt)}` : ""}${item.lastSuccessAt ? ` · last ok ${date(item.lastSuccessAt)}` : ""}</p>${item.lastFailure ? `<pre>${escape(item.lastFailure.kind)}: ${escape(short(item.lastFailure.message, 400))}</pre>` : ""}</article>`,
+    )
+    .join("");
+  const chains = providers.agents
+    .map(
+      (agent) =>
+        `<div class="verification-row"><span>${escape(agent.name)} <span class="muted">${escape(agent.role)}</span></span><strong>${agent.chain.map(escape).join(" → ")}</strong></div>`,
+    )
+    .join("");
+  const delegations = providers.delegations
+    .map(
+      (item) =>
+        `<article class="artifact"><div><strong>${escape(item.agent)} · ${escape(item.model ?? item.provider ?? "failed")}</strong><span class="muted">${date(item.createdAt)} · ${duration(item.durationMs)} · ${compact(item.contextChars)} chars read · ${compact((item.inputTokens ?? 0) + (item.outputTokens ?? 0))} tokens</span></div>${item.failover.length ? `<p class="muted">Failed over from ${item.failover.map((f) => `${escape(f.provider)} (${escape(f.kind)})`).join(", ")}</p>` : ""}${item.error ? `<pre>${escape(short(item.error, 400))}</pre>` : ""}</article>`,
+    )
+    .join("");
+  $("#mission").innerHTML =
+    `<section class="mission-header"><div class="mission-kicker"><span class="eyebrow">ROUTING</span></div><div class="mission-title"><h1>Models &amp; routing</h1></div><p class="muted">Rate-limited, exhausted, or failing models cool down automatically and the next model in each chain takes over. A task retry after a bad result starts with a different model.</p></section><section class="stats"><article><span class="stat-icon green">⌁</span><div><span>Delegations</span><strong>${compact(totals.count)}</strong><p>offloaded tasks</p></div></article><article><span class="stat-icon blue">▤</span><div><span>Context offloaded</span><strong>${compact(totals.contextChars)}</strong><p>chars read by cheap models</p></div></article><article><span class="stat-icon purple">◈</span><div><span>Delegate tokens</span><strong>${compact(totals.inputTokens + totals.outputTokens)}</strong><p>reported by providers</p></div></article><article><span class="stat-icon orange">⚑</span><div><span>Unhealthy now</span><strong>${providers.providers.filter((item) => item.state !== "healthy").length}</strong><p>of ${providers.providers.length} providers</p></div></article></section><div class="overview-grid"><section class="panel"><div class="section-title"><h2>Provider health</h2><span>this daemon's lifetime</span></div>${rows || '<p class="muted">No providers configured.</p>'}</section><section class="panel"><div class="section-title"><h2>Failover chains</h2><span>tried left to right</span></div>${chains}</section></div><section class="panel artifact-panel"><div class="section-title"><h2>Recent delegations</h2><span>latest 30</span></div>${delegations || '<p class="muted">Nothing delegated yet. Use the delegate MCP tool from Claude Code.</p>'}</section>`;
+}
 let chatSignature = "";
 function renderChat() {
   if (!detail) return;
@@ -243,7 +276,10 @@ async function refresh() {
     if (!selected || !state.jobs.some((job) => job.id === selected))
       selected = state.jobs[0]?.id ?? "";
     renderJobs();
-    if (selected) {
+    if (view === "models") {
+      providers = await api("/api/providers");
+      if (view === "models") renderModels();
+    } else if (selected) {
       const current = selected;
       const found = await api(jobUrl());
       if (selected === current) {
@@ -279,6 +315,11 @@ function showNew() {
 $("#new-job").addEventListener("click", showNew);
 $("#first-job").addEventListener("click", showNew);
 $("#filter-jobs").addEventListener("input", renderJobs);
+$("#providers-view").addEventListener("click", () => {
+  view = "models";
+  location.hash = "models";
+  void refresh();
+});
 document.addEventListener("click", async (event) => {
   const button = event.target.closest("button");
   if (!button) return;
@@ -398,7 +439,8 @@ $("#sweep").addEventListener("click", async () => {
   }
 });
 window.addEventListener("hashchange", () => {
-  if (location.hash.slice(1) !== selected) choose(location.hash.slice(1));
+  if (location.hash === "#models") return;
+  if (location.hash.slice(1) !== selected || view !== "mission") choose(location.hash.slice(1));
 });
 document.addEventListener("keydown", (event) => {
   if (

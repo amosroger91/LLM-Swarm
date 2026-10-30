@@ -204,6 +204,15 @@ progress::-moz-progress-bar {
   border-radius: 3px;
   padding: 2px 4px;
 }
+.providers-link {
+  width: 100%;
+  justify-content: flex-start;
+  margin-top: 8px;
+  padding: 9px 13px;
+}
+.providers-link span {
+  font-size: 11px;
+}
 .job-search {
   margin: 18px 4px 25px;
   display: flex;
@@ -706,6 +715,7 @@ progress::-moz-progress-bar {
   background: #a585e71a;
   border-color: #a585e725;
 }
+.badge.healthy,
 .badge.done,
 .badge.completed,
 .badge.approved,
@@ -715,6 +725,8 @@ progress::-moz-progress-bar {
   background: #75bf9b12;
   border-color: #75bf9b25;
 }
+.badge.cooling_down,
+.badge.unavailable,
 .badge.failed,
 .badge.blocked,
 .badge.waiting,

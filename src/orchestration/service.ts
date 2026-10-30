@@ -1,12 +1,22 @@
 import path from "node:path";
 import type { SwarmConfig } from "../config/schema.js";
 import { resolveWorkerCount } from "../config/schema.js";
-import type { ProfileConfig } from "../config/schema.js";
+import type { ProfileConfig, ProviderConfig } from "../config/schema.js";
 import { isTerminalJob } from "../domain.js";
 import { SwarmError, errorMessage, isRetryable } from "../errors.js";
 import type { WorkspacePort } from "../git/workspace.js";
 import { silentLogger, type Logger } from "../logging/logger.js";
 import { createProvider } from "../providers/registry.js";
+import { FailoverProvider } from "../providers/failover.js";
+import { providerHealth } from "../providers/health.js";
+import {
+  delegate,
+  delegateMap,
+  type DelegateInput,
+  type DelegateMapInput,
+  type DelegateMapResult,
+  type DelegateResult,
+} from "./delegate.js";
 import { extractJsonValue } from "../providers/parse.js";
 import type { AgentProvider, ProviderResponse, ProviderRequest } from "../providers/types.js";
 import { workspaceTools } from "./tools.js";
@@ -56,9 +66,27 @@ export interface StartJobInput {
 export function configProviderResolver(
   redact: (text: string) => string = (text) => text,
 ): ProviderResolver {
+  // A member that cannot be built (missing CLI, bad config) fails at call time instead, so
+  // the chain skips it rather than the whole agent failing.
+  const build = (name: string, config: ProviderConfig): AgentProvider => {
+    try {
+      return createProvider(name, config, redact);
+    } catch (error) {
+      return {
+        name,
+        capabilities: config.capabilities,
+        complete: () => Promise.reject(error),
+      };
+    }
+  };
   return {
     forProfile(profile) {
-      return createProvider(profile.providerName, profile.config, redact);
+      // Every provider goes through the failover wrapper so health is tracked even without
+      // fallbacks; a one-member chain rethrows the original error unchanged.
+      return new FailoverProvider([
+        build(profile.providerName, profile.config),
+        ...profile.fallbacks.map((fallback) => build(fallback.name, fallback.config)),
+      ]);
     },
   };
 }
@@ -217,9 +245,9 @@ export class Orchestrator {
       });
     };
     const totalTimeout =
-      provider.capabilities.toolCalling && request.tools?.length
+      (provider.capabilities.toolCalling && request.tools?.length
         ? this.config.agentTimeoutMs
-        : (request.timeoutMs ?? this.config.providerTimeoutMs);
+        : (request.timeoutMs ?? this.config.providerTimeoutMs)) * (provider.maxAttempts ?? 1);
     const signal = AbortSignal.any([
       this.shutdownSignal.signal,
       ...(request.signal ? [request.signal] : []),
@@ -251,6 +279,14 @@ export class Orchestrator {
           usage: response.usage,
           durationMs: Date.now() - started,
         });
+      if (response.failover?.length)
+        this.store.addEvent(
+          metadata.jobId!,
+          "provider.failover",
+          metadata.taskId ? "task" : "job",
+          metadata.taskId ?? metadata.jobId!,
+          { role: metadata.role, servedBy: response.provider, failed: response.failover },
+        );
       return response;
     } catch (error) {
       if (!observed)
@@ -267,9 +303,12 @@ export class Orchestrator {
   }
 
   private executionTimeout(profile: AgentProfileRecord): number {
-    return profile.config.type !== "cli" && profile.config.capabilities.toolCalling
-      ? this.config.agentTimeoutMs
-      : this.config.providerTimeoutMs;
+    return (
+      (profile.config.type !== "cli" && profile.config.capabilities.toolCalling
+        ? this.config.agentTimeoutMs
+        : this.config.providerTimeoutMs) *
+      (1 + profile.fallbacks.length)
+    );
   }
 
   private extendedPlan(jobId: string, additions: unknown[], contracts: string[]): Plan {
@@ -486,6 +525,18 @@ export class Orchestrator {
 
   status(jobId: string): Record<string, unknown> {
     return statusPayload(this.store, jobId);
+  }
+
+  /** Recent jobs, one compact line of state each. */
+  jobs(limit = 20): Array<Record<string, unknown>> {
+    return this.store.listJobs(limit).map((job) => ({
+      job_id: job.id,
+      status: job.status,
+      goal: (job.goal ?? job.task).slice(0, 160),
+      repo: job.repoPath,
+      tasks: this.store.taskCounts(job.id),
+      updated_at: job.updatedAt,
+    }));
   }
 
   result(jobId: string): Record<string, unknown> {
@@ -891,16 +942,105 @@ export class Orchestrator {
       const name = profile[role];
       const agent = this.config.agents[name];
       if (!agent) throw new SwarmError(`Unknown agent ${name}`, "bad_config");
-      const provider = this.config.providers[agent.provider];
-      if (!provider) throw new SwarmError(`Unknown provider ${agent.provider}`, "bad_config");
-      return {
-        name,
-        role,
-        providerName: agent.provider,
-        config: provider,
-        systemPrompt: agent.systemPrompt,
-      };
+      return { ...this.agentSnapshot(name), role };
     });
+  }
+
+  private agentSnapshot(
+    name: string,
+  ): Omit<
+    AgentProfileRecord,
+    "id" | "jobId" | "model" | "capabilitiesJson" | "createdAt" | "providerType" | "systemPrompt"
+  > & { systemPrompt?: string } {
+    const agent = this.config.agents[name];
+    if (!agent) throw new SwarmError(`Unknown agent ${name}`, "bad_config");
+    const provider = this.config.providers[agent.provider];
+    if (!provider) throw new SwarmError(`Unknown provider ${agent.provider}`, "bad_config");
+    return {
+      name,
+      role: agent.role,
+      providerName: agent.provider,
+      config: provider,
+      fallbacks: agent.fallbacks.map((fallback) => ({
+        name: fallback,
+        config: this.config.providers[fallback]!,
+      })),
+      systemPrompt: agent.systemPrompt,
+    };
+  }
+
+  private delegateDeps(): Parameters<typeof delegate>[0] {
+    return {
+      config: this.config,
+      store: this.store,
+      signal: this.shutdownSignal.signal,
+      providerFor: (name) => {
+        const snapshot = this.agentSnapshot(name);
+        return this.providers.forProfile({
+          ...snapshot,
+          id: name,
+          jobId: "",
+          providerType: snapshot.config.type,
+          model: "model" in snapshot.config ? (snapshot.config.model ?? null) : null,
+          capabilitiesJson: JSON.stringify(snapshot.config.capabilities),
+          systemPrompt: snapshot.systemPrompt ?? null,
+          createdAt: "",
+        });
+      },
+    };
+  }
+
+  /** Run one bounded task on a cheap agent and return only its answer. No git, no job. */
+  delegate(input: DelegateInput): Promise<DelegateResult> {
+    return delegate(this.delegateDeps(), input);
+  }
+
+  /** Run the same task on each file in parallel, optionally combining the answers. */
+  delegateMap(input: DelegateMapInput): Promise<DelegateMapResult> {
+    return delegateMap(this.delegateDeps(), input);
+  }
+
+  /** Routing view: each configured provider's health and each agent's failover chain. */
+  providersView(): Record<string, unknown> {
+    return {
+      providers: providerHealth.snapshot(Object.keys(this.config.providers)).map((health) => {
+        const config = this.config.providers[health.name]!;
+        return {
+          ...health,
+          type: config.type,
+          model: "model" in config ? (config.model ?? null) : null,
+        };
+      }),
+      agents: Object.entries(this.config.agents).map(([name, agent]) => ({
+        name,
+        role: agent.role,
+        chain: [agent.provider, ...agent.fallbacks],
+      })),
+      delegate: {
+        agent: this.config.delegate.agent ?? null,
+        totals: this.store.delegationTotals(),
+      },
+    };
+  }
+
+  /** Resolve when the job is terminal, needs an answer, or the timeout passes. */
+  async wait(
+    jobId: string,
+    timeoutMs: number,
+  ): Promise<{ done: boolean; blocked: boolean; status: string }> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const job = this.store.mustJob(jobId);
+      const done = isTerminalJob(job.status);
+      const blocked = this.store
+        .listDecisions(jobId)
+        .some((decision) => decision.blocking && decision.status === "open");
+      const remaining = deadline - Date.now();
+      if (done || blocked || remaining <= 0) return { done, blocked, status: job.status };
+      const pause = delay(Math.min(remaining, 1500));
+      const running = this.inflight.get(jobId);
+      await (running ? Promise.race([running, pause]) : pause);
+    }
   }
 
   private async plan(jobId: string, signal: AbortSignal): Promise<void> {
@@ -1245,7 +1385,13 @@ export class Orchestrator {
           signal,
           timeoutMs: Math.min(this.config.providerTimeoutMs, profile.config.timeoutMs),
           expectJson: profile.config.capabilities.structuredOutput,
-          metadata: { jobId, taskId: claim.task.stableId, role: "worker" },
+          metadata: {
+            jobId,
+            taskId: claim.task.stableId,
+            role: "worker",
+            // A retry after a failed attempt starts with the next model in the chain.
+            attempt: String(claim.task.attemptCount),
+          },
           tools: workspaceTools({
             root: workspacePath.path,
             allowedPaths: claim.task.kind === "revision" ? undefined : claim.task.fileAreas,
@@ -1257,9 +1403,10 @@ export class Orchestrator {
             signal,
           }),
         }),
-        profile.config.type !== "cli" && profile.config.capabilities.toolCalling
+        (profile.config.type !== "cli" && profile.config.capabilities.toolCalling
           ? this.config.agentTimeoutMs
-          : Math.min(this.config.providerTimeoutMs, profile.config.timeoutMs),
+          : Math.min(this.config.providerTimeoutMs, profile.config.timeoutMs)) *
+          (1 + profile.fallbacks.length),
         signal,
       );
       const result = this.readWorkerResult(response, profile);

@@ -1,0 +1,244 @@
+# Hybrid swarm: a strong model plans and reviews, cheap models execute.
+#
+#   planner / reviewer : Claude Code CLI (your Claude subscription or ANTHROPIC_API_KEY)
+#                        -> falls back to Gemini, then local Ollama
+#   workers            : local Ollama with native tool calling
+#                        -> Groq -> Gemini -> OpenRouter free tier
+#   delegate (MCP)     : fastest local model -> free APIs
+#
+# Profiles: hybrid (default), claude (Claude everywhere), local (no Claude at all).
+#
+# A provider that is rate limited, out of quota, down, or missing its API key cools down
+# automatically and the next one in the chain takes the request. A task retry after a bad
+# result starts with the next model. See docs/failover.md.
+#
+# Free-tier model names change often. Run `llm-swarm providers --config config/hybrid.yaml`
+# to ping every provider, then adjust `model:` values that fail. Unused providers are fine:
+# a missing API key only marks that provider unavailable.
+# Do not put API keys in this file. Name the environment variable only.
+
+dataDir: ~/.llm-swarm # resolved relative to this file unless absolute; see docs/configuration.md
+defaultProfile: hybrid
+defaultWorkerCount: 3
+maxWorkerCount: 5
+defaultMaxAttempts: 3
+maxReviewRounds: 3
+providerTimeoutMs: 600000 # Claude planning a large repo can take minutes
+agentTimeoutMs: 1800000
+jobTimeoutMs: 14400000 # four hours for long-running missions
+logLevel: info
+writeSnapshot: true
+requireChecks: true
+# Configure checks for each target repository, e.g.
+# checks:
+#   - command: node
+#     args: ["--run", "test"]
+checks: []
+
+delegate:
+  agent: delegate
+  maxConcurrency: 4
+
+dashboard:
+  port: 4317
+  autoStart: true
+
+maintenance:
+  enabled: true
+  intervalMs: 30000
+  maxAutoResumes: 5
+
+providers:
+  # ---- strong: planning and review -------------------------------------------------
+  claude:
+    type: cli
+    command: claude
+    model: opus # any `claude --model` value: opus, sonnet, haiku, or a full model id
+    args:
+      - -p
+      - --output-format
+      - json
+      - --model
+      - "{model}"
+      # Replace Claude Code's ~20K-token default system prompt; the swarm sends its own
+      # instructions in the prompt. Measured: ~20.2K -> ~3.2K input tokens per call.
+      - --system-prompt
+      - You are a senior software engineer acting as a planning and review engine. Follow the instructions in the user message exactly and return only what they ask for.
+      # Planning context is supplied in the prompt; expose read-only exploration only.
+      - --tools
+      - Read,Grep,Glob
+      - --allowedTools
+      - Read,Grep,Glob
+      # Don't load your MCP servers (including this swarm) inside the planner.
+      - --strict-mcp-config
+    promptTransport: stdin
+    outputParser: claude-json
+    timeoutMs: 900000
+    envPass: ["ANTHROPIC_API_KEY"]
+    documentedStatus: help-checked
+    capabilities:
+      structuredOutput: false
+      toolCalling: false
+      streaming: false
+      nonInteractive: true
+    notes: >
+      Flags checked against `claude --help` and exercised with a live call on 2026-10-30.
+      Uses the local Claude Code login. Hitting a usage limit is detected as exhaustion and
+      the planner falls back to the next provider until the limit resets.
+
+  # Optional Claude Code worker for the `claude` profile (edits its worktree directly).
+  claude-worker:
+    type: cli
+    command: claude
+    model: sonnet
+    args:
+      - -p
+      - --output-format
+      - json
+      - --model
+      - "{model}"
+      - --strict-mcp-config
+      - --tools
+      - Read,Write,Edit,Grep,Glob
+      - --allowedTools
+      - Read,Write,Edit,Grep,Glob
+      - --permission-mode
+      - acceptEdits
+    promptTransport: stdin
+    outputParser: claude-json
+    timeoutMs: 900000
+    envPass: ["ANTHROPIC_API_KEY"]
+    documentedStatus: help-checked
+    capabilities:
+      structuredOutput: false
+      toolCalling: false
+      streaming: false
+      nonInteractive: true
+    notes: >
+      No shell tool: the swarm runs configured checks itself. Exercised with a live job on
+      2026-10-30.
+
+  # ---- local: execution ------------------------------------------------------------
+  ollama-tools:
+    type: openai_compatible
+    protocol: ollama
+    baseUrl: http://127.0.0.1:11434
+    model: qwen2.5-coder:7b # a larger coder model (e.g. 14b/32b) gives better results
+    apiKeyOptional: true
+    jsonMode: json_object
+    contextTokens: 32768
+    maxOutputTokens: 8192
+    maxToolRounds: 24
+    timeoutMs: 600000
+    capabilities:
+      structuredOutput: true
+      toolCalling: true
+      streaming: false
+      nonInteractive: true
+
+  ollama-chat:
+    type: openai_compatible
+    protocol: ollama
+    baseUrl: http://127.0.0.1:11434
+    model: qwen2.5-coder:7b
+    apiKeyOptional: true
+    jsonMode: json_object
+    contextTokens: 32768
+    maxOutputTokens: 8192
+    timeoutMs: 600000
+    capabilities:
+      structuredOutput: true
+      toolCalling: true
+      streaming: false
+      nonInteractive: true
+
+  # ---- free remote: failover -------------------------------------------------------
+  groq:
+    type: openai_compatible
+    baseUrl: https://api.groq.com/openai/v1
+    model: llama-3.3-70b-versatile
+    apiKeyEnv: GROQ_API_KEY
+    jsonMode: json_object
+    maxOutputTokens: 8192
+    maxToolRounds: 24
+    capabilities:
+      structuredOutput: true
+      toolCalling: true
+      streaming: false
+      nonInteractive: true
+
+  gemini-api:
+    type: openai_compatible
+    baseUrl: https://generativelanguage.googleapis.com/v1beta/openai
+    model: gemini-2.5-flash
+    apiKeyEnv: GEMINI_API_KEY
+    jsonMode: json_object
+    maxOutputTokens: 8192
+    maxToolRounds: 24
+    capabilities:
+      structuredOutput: true
+      toolCalling: true
+      streaming: false
+      nonInteractive: true
+
+  openrouter-free:
+    type: openai_compatible
+    baseUrl: https://openrouter.ai/api/v1
+    model: qwen/qwen3-coder:free
+    apiKeyEnv: OPENROUTER_API_KEY
+    jsonMode: json_object
+    maxOutputTokens: 8192
+    maxToolRounds: 24
+    capabilities:
+      structuredOutput: true
+      toolCalling: true
+      streaming: false
+      nonInteractive: true
+
+agents:
+  planner:
+    role: planner
+    provider: claude
+    fallbacks: [gemini-api, ollama-chat]
+  reviewer:
+    role: reviewer
+    provider: claude
+    fallbacks: [gemini-api, ollama-chat]
+  worker:
+    role: worker
+    provider: ollama-tools
+    fallbacks: [groq, gemini-api, openrouter-free]
+  delegate:
+    role: worker
+    provider: ollama-chat
+    fallbacks: [groq, gemini-api, openrouter-free]
+  claude-worker:
+    role: worker
+    provider: claude-worker
+  # All-local and all-free variants for when Claude is not wanted.
+  local-planner:
+    role: planner
+    provider: ollama-chat
+    fallbacks: [gemini-api, groq]
+  local-reviewer:
+    role: reviewer
+    provider: ollama-chat
+    fallbacks: [gemini-api, groq]
+
+profiles:
+  hybrid:
+    planner: planner
+    worker: worker
+    reviewer: reviewer
+    workerCount: 3
+  # Everything on Claude, for work where quality matters more than cost.
+  claude:
+    planner: planner
+    worker: claude-worker
+    reviewer: reviewer
+    workerCount: 2
+  local:
+    planner: local-planner
+    worker: worker
+    reviewer: local-reviewer
+    workerCount: 2
