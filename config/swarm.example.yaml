@@ -14,6 +14,13 @@ logLevel: info
 writeSnapshot: true
 requireChecks: true
 # Configure checks for the target repository. An empty list is reported as NOT RUN.
+# Checks run before task handoff and again on final integration. For multiple tasks,
+# provide scoped checks that pass with only that task and its dependencies present.
+# Tasks can select verificationChecks: [0] using zero-based indices; omission runs all.
+# Every handoff also reruns all dependency ancestors' selected checks.
+# Optional name labels evidence. protectedPaths explicitly prevents workers from
+# editing verifier files/directories, including via patches, commits, and revisions.
+# Definitions are pinned per job. See docs/configuration.md for a scoped example.
 checks: []
 
 decision:

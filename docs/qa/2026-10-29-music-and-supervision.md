@@ -52,4 +52,6 @@ Ten synthetic music-domain helper cases each ran in direct, one-worker pipeline,
 
 These are results from the original patch-response path, not evidence that the finished framework improves a model's coding ability. They expose patch-format and coordination overhead. Additional native-tool trials found and helped reproduce the placeholder-patch defect; those exploratory trials were interrupted to isolate model capacity for application validation and are not a complete comparative benchmark. The reproducible driver remains `scripts/benchmark.ts`; set `SWARM_BENCHMARK_TOOLS=1` for the native Ollama path. Raw local evidence is retained under ignored `artifacts/`.
 
+The current driver assigns one protected, scoped acceptance command to each module task before handoff and runs both commands on final results. The generated checker accepts `left` or `right`, defaulting to both. Direct trials use the same protected checker and verify that its accepted commit and Git working tree remain unchanged by checks. This updates the experiment protocol for coordinator task verification; the historical numbers above have not been rerun under that protocol.
+
 Local transport tests establish functionality, not public relay uptime, NAT traversal across arbitrary networks, or benchmark generality. The live agents remain trusted host processes, not an operating-system sandbox.

@@ -9,6 +9,14 @@ export const PlanTaskSchema = z.object({
   dependencies: z.array(z.string()).max(20).default([]),
   suggestedRole: z.string().max(100).optional(),
   fileAreas: z.array(z.string().max(300)).max(30).default([]),
+  verificationChecks: z
+    .array(z.number().int().nonnegative())
+    .min(1)
+    .max(20)
+    .refine((indices) => new Set(indices).size === indices.length, {
+      message: "Verification check indices must be unique",
+    })
+    .optional(),
 });
 
 export const PlanSchema = z.object({
@@ -103,6 +111,7 @@ export function widenSingleTaskFiles(jobTask: string, plan: Plan): Plan {
 
 export function validatePlan(
   input: unknown,
+  checkCount?: number,
 ): { ok: true; plan: Plan } | { ok: false; errors: string[] } {
   const parsed = PlanSchema.safeParse(coercePlanInput(input));
   if (!parsed.success) {
@@ -116,6 +125,11 @@ export function validatePlan(
   const plan = parsed.data;
   const errors: string[] = [];
   for (const task of plan.tasks) {
+    for (const index of task.verificationChecks ?? []) {
+      if (checkCount !== undefined && index >= checkCount) {
+        errors.push(`task ${task.id} references unknown verification check ${index}`);
+      }
+    }
     task.fileAreas = task.fileAreas.map((area) =>
       area.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, ""),
     );

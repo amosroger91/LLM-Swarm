@@ -10,7 +10,7 @@ Use a strong model (Claude Code) to plan and review, and local Ollama or free re
 
 ## Overview
 
-LLM Swarm takes one task, asks a planner for a validated plan, and runs up to five workers per job in separate Git worktrees. Each worker gets a complete checkout under the target repository's `workspaces/` directory, its own branch, and the committed output of its dependencies. SQLite is the source of truth for jobs, tasks, chat, votes, and reviews. The coordinator integrates the results, runs configured checks, and asks a reviewer to assess the complete diff. Remote pushes, changes to the base branch, and PR creation are not automated by the swarm.
+LLM Swarm takes one task, asks a planner for a validated plan, and runs up to five workers per job in separate Git worktrees. Each worker gets a complete checkout under the target repository's `workspaces/` directory, its own branch, and the verified committed output of its dependencies. Before a task can hand off, the coordinator runs its configured checks against the commit and records the evidence. Failed checks return the task for bounded repair. SQLite is the source of truth for jobs, tasks, chat, votes, and reviews. The coordinator then integrates the results, runs every configured check, and asks a reviewer to assess the complete diff. Remote pushes, changes to the base branch, and PR creation are not automated by the swarm.
 
 ## Architecture
 
@@ -45,7 +45,7 @@ The first MCP connection starts a detached daemon that runs the scheduler and th
 
 Point an MCP client at `node dist/cli.js mcp --config config/swarm.example.yaml` after a build. Configure `checks` for the target repository before starting an implementation job. Checks are required by default; a deliberately unverified experiment can set `requireChecks: false`. With no config file and no `SWARM_CONFIG` variable, the process uses the built-in Ollama profile at `http://127.0.0.1:11434/v1`.
 
-The target repository must already have a commit. A typical checked run uses a command such as `node scripts/verify.mjs` from that repository. Commands run directly without a shell; on Windows, use a real executable rather than `npm.cmd`. Install any dependencies the checks require in the worktree or configure an appropriate executable path.
+The target repository must already have a commit. A typical checked run uses a command such as `node scripts/verify.mjs` from that repository. Each task's checks must pass with only that task and its dependencies implemented. Configure scoped checks for parallel tasks, or use one task when the checker requires the complete change. Commands run directly without a shell; on Windows, use a real executable rather than `npm.cmd`. Install any dependencies the checks require in each worktree or configure an appropriate executable path. See [verification configuration](docs/configuration.md#decisions-git-and-checks) for check selection and protected acceptance files.
 
 Check a job from another terminal:
 
@@ -139,9 +139,10 @@ test/                      Vitest suite, no network and no real agent CLIs
 - Worktrees live at `<repo>/workspaces/<job>/agent-<task>-<attempt>/`. They are retained by default for inspection. Set `git.cleanupWorktrees: true` to remove successful task worktrees; integration remains available. `dataDir` holds the database and snapshots, separate from worktree storage.
 - The coordinator adds `/workspaces/` to Git's local exclude file. This repository also excludes it from lint, formatting, tests, and source discovery. Other target projects must exclude it from their own build/test globs and watchers; see [workspace setup](docs/workspaces.md).
 - Every job pins its starting commit. Dependent workers inherit prerequisite commits. Independent tasks must own disjoint file areas; explicit dependencies permit sequential edits to the same file.
+- Check commands, `requireChecks`, and explicitly configured `protectedPaths` are pinned with each job. Optional task `verificationChecks` selects unique zero-based check indices. Each handoff reruns the union of that task's and every dependency ancestor's selections to catch regressions; omission by any of them runs all checks. Workers cannot change protected verifier files. Legacy jobs pin the current definitions on their next execution and use all checks when no selection was stored.
 - Status and result commands read stored job state without starting a scheduler. Cancellation from another process reaches the active scheduler through SQLite. A database permits one scheduler owner at a time, and recovery only runs after ownership is acquired.
 - Patches are validated before any write, including header consistency, reserved paths, traversal, and symlink/junction checks. CLI tools and configured checks are trusted host processes: worktrees are not an operating-system sandbox.
-- Review cannot approve a truncated diff or prompt. Check results record `passed`, `failed`, or `not_run`; the default configuration refuses unchecked completion.
+- Review cannot approve a truncated diff or prompt. Task evidence records the check indices and exact commit in `task-checks` artifacts. Check results record `passed`, `failed`, or `not_run`; the default configuration refuses unchecked handoffs and completion. Goal coverage depends on the acceptance checks configured for the target project.
 - Git commands are argument arrays with `shell: false`. The commit author is set with `GIT_AUTHOR_*` and `GIT_COMMITTER_*` (`LLM Swarm` / `swarm@localhost`). The user's git config is not modified.
 - Agent CLIs are not given a shell. `.cmd`, `.bat`, and `.ps1` shims are rejected. On Windows, point `opencode` at `opencode.exe` if PATH resolves `opencode.ps1`.
 - The grok, opencode, and gemini profiles in the sample config were checked against local `--help` text on 2026-10-29. They were not called against a live model. `--always-approve` and `--yolo` are left off.

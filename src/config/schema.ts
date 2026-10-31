@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { SwarmError } from "../errors.js";
+import { validateFilePath } from "../safety/files.js";
 
 export const CapabilitiesSchema = z
   .object({
@@ -111,8 +112,28 @@ const ProfileSchema = z
 
 const CheckSchema = z
   .object({
+    name: z.string().min(1).max(200).optional(),
     command: z.string().min(1),
     args: z.array(z.string()).max(50).default([]),
+    protectedPaths: z
+      .array(
+        z
+          .string()
+          .min(1)
+          .max(300)
+          .superRefine((file, ctx) => {
+            try {
+              validateFilePath(file);
+            } catch {
+              ctx.addIssue({
+                code: "custom",
+                message: "Use a repository-relative protected path without traversal or globs",
+              });
+            }
+          }),
+      )
+      .max(100)
+      .optional(),
   })
   .strict();
 

@@ -125,13 +125,40 @@ git:
   allowRemotePr: false
 requireChecks: true
 checks:
-  - command: node
+  - name: Project acceptance
+    command: node
     args: ["scripts/verify.mjs"] # use an actual checker from the target project
+    protectedPaths: ["scripts/verify.mjs"]
 ```
 
-Checks run in the integration worktree with `shell: false`, the allowlisted environment, and job cancellation. On Windows, `.cmd`, `.bat`, and `.ps1` shims are rejected; use a real executable, such as Node with the checker script as an argument. Dependencies required by the checker must be available in that checkout.
+Checks run in each task's worktree before handoff and all run again in the integration worktree, with `shell: false`, the allowlisted environment, and job cancellation. On Windows, `.cmd`, `.bat`, and `.ps1` shims are rejected; use a real executable, such as Node with the checker script as an argument. Dependencies required by the checker must be available in each checkout. A checker must leave HEAD and the Git working tree unchanged; ignore generated build output in the target project before running it.
 
-An empty list records `not_run`. The default `requireChecks: true` fails that job before model review. Set it to `false` only for deliberately unverified runs; the report retains the missing-check evidence. An incomplete diff or review prompt always fails before approval, regardless of `requireChecks`.
+Task plans may set `verificationChecks` to a nonempty array of unique zero-based indices into `checks`. Indices must identify existing configured commands. Each handoff reruns the union of the task's and every dependency ancestor's selections to detect dependent regressions. Omission by the task or any ancestor runs all configured checks, including for legacy tasks and final revision tasks. The planner receives the check catalog and may select indices; it cannot supply executable commands. All checks still run after integration, regardless of task selections.
+
+Select checks that can pass with only the task and its dependencies implemented. For example, a target repository with independent queue and library modules can provide these existing acceptance files:
+
+```yaml
+requireChecks: true
+checks:
+  - name: Queue acceptance # index 0
+    command: node
+    args: ["--test", "test/queue.acceptance.test.mjs"]
+    protectedPaths: ["test/queue.acceptance.test.mjs"]
+  - name: Library acceptance # index 1
+    command: node
+    args: ["--test", "test/library.acceptance.test.mjs"]
+    protectedPaths: ["test/library.acceptance.test.mjs"]
+```
+
+The queue task can select `verificationChecks: [0]`; the library task can select `[1]`. Each file must test its own module without depending on unfinished independent work. A wiring task that depends on both reruns both checks even if its own selection contains only `[1]`, because check `0` is inherited from the queue ancestor. It can also omit the selection to run all checks. If only a whole-app checker exists, keep the change in one task or configure narrower check commands first. The framework runs the supplied suite; it does not automatically generate acceptance tests or establish that the suite covers every part of the human goal.
+
+`name` is an optional evidence label. `protectedPaths` optionally lists repository-relative files or directories that workers must preserve. The union across all checks is protected for every worker, including revisions, and applies to direct file tools, returned patches, agent commits, and checkpoints. Protection is explicit: include imported verifier helpers, fixtures, and configuration when they must remain independent. With the field omitted, no additional paths are protected. Paths cannot be absolute, traverse outside the repository, or contain globs.
+
+The job pins its check definitions, protected paths, and `requireChecks` policy before implementation. Restarting with an edited config does not change that job's verification contract or the meaning of its stored indices. Start a new job to use new definitions. Existing jobs from before this feature pin the current definitions on their next execution; missing task selections default to all checks.
+
+A `task-checks` artifact records the task/run, check indices, commit, status, and diagnostic summary. If a prerequisite commit has no matching successful evidence, the coordinator verifies the assembled dependency snapshot before starting the worker and records `dependency-checks`. Failed task checks keep the commit as a scoped repair checkpoint and return their evidence to the next bounded attempt; dependents wait for a successful gate. A worker's own `run_check` call does not replace the coordinator's gate. Long diagnostic summaries may be truncated while the JSON record and verification metadata remain intact.
+
+An empty list records `not_run`. The default `requireChecks: true` fails the task before handoff. Set it to `false` only for deliberately unverified runs; the report retains the missing-check evidence at the task and integration stages. An incomplete diff or review prompt always fails before approval, regardless of `requireChecks`.
 
 ## Limits
 

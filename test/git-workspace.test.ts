@@ -30,7 +30,187 @@ function workspace(): GitWorkspace {
   });
 }
 
+async function protectedWorkspace() {
+  const dir = tempDir("swarm-verification-");
+  dirs.push(dir);
+  const repo = path.join(dir, "repo");
+  initRepo(repo);
+  fs.mkdirSync(path.join(repo, "test"));
+  fs.writeFileSync(path.join(repo, "test/contract.cjs"), "original verifier\n");
+  fs.writeFileSync(path.join(repo, ".gitignore"), "generated/\ntest/ignored/\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "trusted verifier"]);
+  const manager = workspace();
+  const context = await manager.assertRepo(repo);
+  const run = await manager.createRunWorkspace({
+    repoRoot: repo,
+    dataDir: dir,
+    jobId: "job-verification",
+    stableId: "worker",
+    attempt: 1,
+    baseCommit: context.baseCommit,
+  });
+  return { manager, run, repo };
+}
+
 describe("git workspace", () => {
+  it("rejects every protected patch path before materializing any part of the patch", async () => {
+    const { manager, run, repo } = await protectedWorkspace();
+    const patch = (file: string) =>
+      `diff --git a/${file} b/${file}\nnew file mode 100644\n--- /dev/null\n+++ b/${file}\n@@ -0,0 +1 @@\n+replacement\n`;
+    await expect(
+      manager.finalizeRun({
+        repoRoot: repo,
+        workspace: run,
+        message: "tampered",
+        patch: patch("allowed.txt") + patch("TEST/contract.cjs"),
+        forbiddenPaths: ["test/"],
+      }),
+    ).rejects.toMatchObject({ code: "protected_verifier", retryable: false });
+    expect(fs.existsSync(path.join(run.path, "allowed.txt"))).toBe(false);
+    expect(fs.readFileSync(path.join(run.path, "test/contract.cjs"), "utf8")).toBe(
+      "original verifier\n",
+    );
+    expect(git(run.path, ["status", "--porcelain"])).toBe("");
+  });
+
+  it.each(["unstaged", "staged", "committed", "deleted", "renamed"])(
+    "rejects %s CLI changes to protected verifiers before dropping files or writing a patch",
+    async (mode) => {
+      const { manager, run, repo } = await protectedWorkspace();
+      const verifier = path.join(run.path, "test/contract.cjs");
+      if (mode === "deleted") fs.unlinkSync(verifier);
+      else if (mode === "renamed") git(run.path, ["mv", "test/contract.cjs", "moved.cjs"]);
+      else fs.writeFileSync(verifier, "tampered verifier\n");
+      if (mode === "staged" || mode === "committed") git(run.path, ["add", "."]);
+      if (mode === "committed") git(run.path, ["commit", "-m", "tampered verifier"]);
+      const before = git(run.path, ["status", "--porcelain"]);
+      await expect(
+        manager.finalizeRun({
+          repoRoot: repo,
+          workspace: run,
+          message: "implementation",
+          patch:
+            "diff --git a/allowed.txt b/allowed.txt\nnew file mode 100644\n--- /dev/null\n+++ b/allowed.txt\n@@ -0,0 +1 @@\n+allowed\n",
+          forbiddenPaths: ["test/contract.cjs"],
+          dropPaths: ["test"],
+        }),
+      ).rejects.toMatchObject({ code: "protected_verifier", retryable: false });
+      expect(git(run.path, ["status", "--porcelain"])).toBe(before);
+      expect(fs.existsSync(path.join(run.path, "allowed.txt"))).toBe(false);
+    },
+  );
+
+  it("rejects untracked protected verifier files while accepting unrelated implementation files", async () => {
+    const { manager, run, repo } = await protectedWorkspace();
+    fs.writeFileSync(path.join(run.path, "test/new.cjs"), "tampered\n");
+    fs.writeFileSync(path.join(run.path, "implementation.ts"), "export const answer = 42;\n");
+    await expect(
+      manager.finalizeRun({
+        repoRoot: repo,
+        workspace: run,
+        message: "implementation",
+        forbiddenPaths: ["test"],
+      }),
+    ).rejects.toMatchObject({ code: "protected_verifier", retryable: false });
+    fs.unlinkSync(path.join(run.path, "test/new.cjs"));
+    const result = await manager.finalizeRun({
+      repoRoot: repo,
+      workspace: run,
+      message: "implementation",
+      forbiddenPaths: ["test"],
+    });
+    expect(result.changedFiles).toEqual(["implementation.ts"]);
+    await expect(manager.verifySnapshot(run.path, result.headCommit!)).resolves.toBeUndefined();
+  });
+
+  it.each(["--assume-unchanged", "--skip-worktree"])(
+    "rejects protected verifier changes hidden behind %s index flags",
+    async (flag) => {
+      const { manager, run, repo } = await protectedWorkspace();
+      git(run.path, ["update-index", flag, "test/contract.cjs"]);
+      fs.writeFileSync(path.join(run.path, "test/contract.cjs"), "bypassed verifier\n");
+      fs.writeFileSync(path.join(run.path, "implementation.ts"), "export const answer = 42;\n");
+      expect(git(run.path, ["status", "--porcelain"])).not.toContain("contract.cjs");
+      await expect(
+        manager.finalizeRun({
+          repoRoot: repo,
+          workspace: run,
+          message: "hidden verifier mutation",
+          forbiddenPaths: ["test"],
+        }),
+      ).rejects.toMatchObject({ code: "protected_verifier", retryable: false });
+    },
+  );
+
+  it.each(["test", "TEST/IGNORED", "test/ignored/contract.cjs"])(
+    "rejects ignored untracked additions within protected path %s",
+    async (protectedPath) => {
+      const { manager, run, repo } = await protectedWorkspace();
+      fs.mkdirSync(path.join(run.path, "test/ignored"));
+      fs.writeFileSync(path.join(run.path, "test/ignored/contract.cjs"), "bypassed verifier\n");
+      fs.writeFileSync(path.join(run.path, "implementation.ts"), "export const answer = 42;\n");
+      expect(git(run.path, ["status", "--porcelain"])).not.toContain("contract.cjs");
+      await expect(
+        manager.finalizeRun({
+          repoRoot: repo,
+          workspace: run,
+          message: "hidden verifier addition",
+          forbiddenPaths: [protectedPath],
+        }),
+      ).rejects.toMatchObject({ code: "protected_verifier", retryable: false });
+    },
+  );
+
+  it.each(["--assume-unchanged", "--skip-worktree"])(
+    "rejects a worktree mutation hidden behind %s even when Git status appears clean",
+    async (flag) => {
+      const { manager, run } = await protectedWorkspace();
+      const expectedCommit = git(run.path, ["rev-parse", "HEAD"]).trim();
+      git(run.path, ["update-index", flag, "README.md"]);
+      fs.writeFileSync(path.join(run.path, "README.md"), "hidden mutation\n");
+      expect(git(run.path, ["status", "--porcelain"])).toBe("");
+      await expect(manager.verifySnapshot(run.path, expectedCommit)).rejects.toMatchObject({
+        code: "verification_changed",
+        retryable: false,
+      });
+    },
+  );
+
+  it.each(["tracked", "staged", "untracked", "head"])(
+    "rejects a verifier that changes the %s snapshot",
+    async (mode) => {
+      const { manager, run } = await protectedWorkspace();
+      const expectedCommit = git(run.path, ["rev-parse", "HEAD"]).trim();
+      if (mode === "head") git(run.path, ["commit", "--allow-empty", "-m", "checker commit"]);
+      else if (mode === "untracked")
+        fs.writeFileSync(path.join(run.path, "checker-output.txt"), "output\n");
+      else {
+        fs.writeFileSync(path.join(run.path, "README.md"), "checker changed source\n");
+        if (mode === "staged") git(run.path, ["add", "README.md"]);
+      }
+      await expect(manager.verifySnapshot(run.path, expectedCommit)).rejects.toMatchObject({
+        code: "verification_changed",
+        retryable: false,
+      });
+    },
+  );
+
+  it("permits ignored generated outputs when verification leaves the source snapshot intact", async () => {
+    const { manager, run, repo } = await protectedWorkspace();
+    fs.mkdirSync(path.join(run.path, "generated"));
+    fs.writeFileSync(path.join(run.path, "generated/build.js"), "compiled\n");
+    fs.writeFileSync(path.join(run.path, "implementation.ts"), "export const answer = 42;\n");
+    const result = await manager.finalizeRun({
+      repoRoot: repo,
+      workspace: run,
+      message: "implementation with ignored build output",
+      forbiddenPaths: ["test"],
+    });
+    expect(result.changedFiles).toEqual(["implementation.ts"]);
+    await expect(manager.verifySnapshot(run.path, result.headCommit!)).resolves.toBeUndefined();
+  });
+
   it("does not execute repository or worktree-root hooks during coordinator commits", async () => {
     const dir = tempDir("swarm-hooks-");
     dirs.push(dir);

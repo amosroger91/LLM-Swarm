@@ -34,9 +34,13 @@ it("recovers a dead scheduler through the cron CLI and reuses the successful pre
       const system = body.messages[0]!.content;
       const prompt = body.messages.at(-1)!.content;
       let result: unknown;
-      if (system.includes("You are the planner"))
-        result = planValue([{ id: "a" }, { id: "b", dependencies: ["a"] }]);
-      else if (system.includes("You are the reviewer"))
+      if (system.includes("You are the planner")) {
+        const plan = planValue([{ id: "a" }, { id: "b", dependencies: ["a"] }]);
+        result = {
+          ...plan,
+          tasks: plan.tasks.map((task, index) => ({ ...task, verificationChecks: [index] })),
+        };
+      } else if (system.includes("You are the reviewer"))
         result = { approved: true, summary: "Both files verified", findings: [] };
       else {
         const task = /Task ([ab]):/.exec(prompt)![1]!;
@@ -59,15 +63,14 @@ it("recovers a dead scheduler through the cron CLI and reuses the successful pre
   const config = testConfig(path.join(root, "data"), {
     providerTimeoutMs: 20000,
     jobTimeoutMs: 60000,
-    checks: [
-      {
-        command: process.execPath,
-        args: [
-          "-e",
-          "const f=require('node:fs');if(f.readFileSync('a.txt','utf8')!=='a\\n'||f.readFileSync('b.txt','utf8')!=='b\\n')process.exit(1)",
-        ],
-      },
-    ],
+    checks: ["a", "b"].map((id) => ({
+      name: `${id} acceptance`,
+      command: process.execPath,
+      args: [
+        "-e",
+        `const f=require('node:fs');if(f.readFileSync('${id}.txt','utf8')!=='${id}\\n')process.exit(1)`,
+      ],
+    })),
     requireChecks: true,
   });
   const provider = config.providers.ollama!;

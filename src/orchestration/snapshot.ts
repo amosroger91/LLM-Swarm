@@ -24,6 +24,7 @@ export function renderSnapshot(input: {
     `Repository: ${input.job.repoPath}`,
     `Base branch: ${input.job.baseBranch}`,
     `Integration branch: ${input.job.integrationBranch ?? "(not created)"}`,
+    `Verification: ${input.job.verification ? `${input.job.verification.checks.length} pinned checks; required: ${input.job.verification.requireChecks}` : "(definitions pin on next execution)"}`,
     "",
     "## Goal",
     input.job.goal ?? input.job.task,
@@ -33,6 +34,7 @@ export function renderSnapshot(input: {
   for (const task of input.tasks) {
     lines.push(
       `- ${task.stableId} [${task.status}] ${task.title} (attempts ${task.attemptCount}/${task.maxAttempts})`,
+      `  Verification checks: ${task.verificationChecks?.join(", ") ?? "all configured checks"}`,
     );
   }
   lines.push("", "## Decisions");

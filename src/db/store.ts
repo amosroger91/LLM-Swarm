@@ -1,7 +1,7 @@
 import { randomUUID, createHash } from "node:crypto";
 import os from "node:os";
 import { z } from "zod";
-import type { ProviderConfig } from "../config/schema.js";
+import type { CheckConfig, ProviderConfig } from "../config/schema.js";
 import { ProviderConfigSchema } from "../config/schema.js";
 import {
   assertJobTransition,
@@ -18,6 +18,11 @@ import { withBusyRetry, type SqliteDatabase } from "./connection.js";
 import type { ProviderUsage } from "../providers/types.js";
 
 const StringArray = z.array(z.string());
+
+export interface JobVerification {
+  checks: CheckConfig[];
+  requireChecks: boolean;
+}
 
 export interface BlockerRecord {
   id: string;
@@ -39,6 +44,7 @@ export interface BlockerRecord {
 }
 
 export interface JobRecord {
+  verification?: JobVerification;
   id: string;
   task: string;
   repoPath: string;
@@ -119,6 +125,7 @@ export interface TaskRecord {
   acceptanceCriteria: string[];
   suggestedRole: string | null;
   fileAreas: string[];
+  verificationChecks?: number[];
   status: TaskStatus;
   kind: "implementation" | "revision";
   attemptCount: number;
@@ -252,9 +259,11 @@ export interface PlannedTaskInput {
   dependencies: string[];
   suggestedRole?: string;
   fileAreas: string[];
+  verificationChecks?: number[];
 }
 
 interface JobRow {
+  verification_json: string | null;
   id: string;
   task: string;
   repo_path: string;
@@ -294,6 +303,7 @@ interface TaskRow {
   acceptance_criteria_json: string;
   suggested_role: string | null;
   file_areas_json: string;
+  verification_checks_json: string | null;
   status: TaskStatus;
   kind: "implementation" | "revision";
   attempt_count: number;
@@ -313,6 +323,9 @@ function strings(value: string | null | undefined): string[] {
 
 function mapJob(row: JobRow): JobRecord {
   return {
+    verification: row.verification_json
+      ? (JSON.parse(row.verification_json) as JobVerification)
+      : undefined,
     id: row.id,
     task: row.task,
     repoPath: row.repo_path,
@@ -354,6 +367,9 @@ function mapTask(row: TaskRow): TaskRecord {
     acceptanceCriteria: strings(row.acceptance_criteria_json),
     suggestedRole: row.suggested_role,
     fileAreas: strings(row.file_areas_json),
+    verificationChecks: row.verification_checks_json
+      ? (JSON.parse(row.verification_checks_json) as number[])
+      : undefined,
     status: row.status,
     kind: row.kind,
     attemptCount: row.attempt_count,
@@ -415,6 +431,17 @@ export class Store {
       .prepare("UPDATE jobs SET base_commit = COALESCE(base_commit, ?) WHERE id = ?")
       .run(commit, jobId);
     return this.mustJob(jobId).baseCommit!;
+  }
+
+  pinVerification(jobId: string, verification: JobVerification): JobVerification {
+    return this.immediate(() => {
+      this.db
+        .prepare("UPDATE jobs SET verification_json = ? WHERE id = ? AND verification_json IS NULL")
+        .run(JSON.stringify(verification), jobId);
+      const pinned = this.mustJob(jobId).verification;
+      if (!pinned) throw new SwarmError("Verification configuration was not persisted", "internal");
+      return pinned;
+    });
   }
 
   requestCancel(jobId: string): { job_id: string; status: string } {
@@ -683,8 +710,8 @@ export class Store {
       const insertTask = this.db.prepare(
         `INSERT INTO tasks (
           id, job_id, stable_id, title, instructions, acceptance_criteria_json, suggested_role,
-          file_areas_json, status, kind, attempt_count, max_attempts, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'implementation', 0, ?, ?, ?)`,
+          file_areas_json, verification_checks_json, status, kind, attempt_count, max_attempts, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'implementation', 0, ?, ?, ?)`,
       );
       for (const task of tasks) {
         const id = randomUUID();
@@ -699,6 +726,7 @@ export class Store {
           JSON.stringify(task.acceptanceCriteria),
           task.suggestedRole ?? null,
           JSON.stringify(task.fileAreas),
+          task.verificationChecks === undefined ? null : JSON.stringify(task.verificationChecks),
           status,
           maxAttempts,
           now,
@@ -1757,17 +1785,26 @@ export class Store {
     const id = randomUUID();
     const now = this.now();
     let summary = input.summary;
-    if (input.kind === "checks" && summary.length > 8000) {
-      const parsed = JSON.parse(summary) as { status: string; summary: string };
-      let limit = Math.min(parsed.summary.length, 6000);
-      do {
-        summary = JSON.stringify({
-          status: parsed.status,
-          summary: parsed.summary.slice(0, limit),
-          truncated: true,
-        });
-        limit = Math.floor(limit * 0.8);
-      } while (summary.length > 8000);
+    if (
+      ["checks", "task-checks", "dependency-checks"].includes(input.kind) &&
+      summary.length > 8000
+    ) {
+      const parsed = JSON.parse(summary) as Record<string, unknown>;
+      if (!parsed || Array.isArray(parsed) || typeof parsed.summary !== "string")
+        throw new SwarmError("Check evidence requires a diagnostic summary", "bad_artifact");
+      const diagnostic = parsed.summary;
+      const metadata = { ...parsed, summary: "", truncated: true };
+      if (JSON.stringify(metadata).length > 8000)
+        throw new SwarmError("Check evidence metadata exceeds the artifact limit", "bad_artifact");
+      let lower = 0;
+      let upper = diagnostic.length;
+      while (lower < upper) {
+        const limit = Math.ceil((lower + upper) / 2);
+        const candidate = JSON.stringify({ ...metadata, summary: diagnostic.slice(0, limit) });
+        if (candidate.length <= 8000) lower = limit;
+        else upper = limit - 1;
+      }
+      summary = JSON.stringify({ ...metadata, summary: diagnostic.slice(0, lower) });
     } else summary = summary.slice(0, 8000);
     this.db
       .prepare(
@@ -2319,8 +2356,8 @@ export class Store {
         ids.set(task.stableId, id);
         this.db
           .prepare(
-            `INSERT INTO tasks (id, job_id, stable_id, title, instructions, acceptance_criteria_json, suggested_role, file_areas_json, status, kind, attempt_count, max_attempts, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'blocked', 'implementation', 0, ?, ?, ?)`,
+            `INSERT INTO tasks (id, job_id, stable_id, title, instructions, acceptance_criteria_json, suggested_role, file_areas_json, verification_checks_json, status, kind, attempt_count, max_attempts, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'blocked', 'implementation', 0, ?, ?, ?)`,
           )
           .run(
             id,
@@ -2331,6 +2368,7 @@ export class Store {
             JSON.stringify(task.acceptanceCriteria),
             task.suggestedRole ?? "worker",
             JSON.stringify(task.fileAreas),
+            task.verificationChecks === undefined ? null : JSON.stringify(task.verificationChecks),
             job.maxAttempts,
             now,
             now,

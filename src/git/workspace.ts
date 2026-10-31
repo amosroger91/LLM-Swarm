@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { GitPolicy } from "../safety/policy.js";
 import { assertRemoteAllowed } from "../safety/policy.js";
@@ -59,8 +60,10 @@ export interface WorkspacePort {
     patch?: string;
     dropPaths?: string[];
     allowedPaths?: string[];
+    forbiddenPaths?: string[];
     signal?: AbortSignal;
   }): Promise<{ headCommit: string | null; changedFiles: string[] }>;
+  verifySnapshot(cwd: string, expectedCommit: string, signal?: AbortSignal): Promise<void>;
   commitForBranch(repoPath: string, branch: string): Promise<string | null>;
   integrate(input: {
     repoRoot: string;
@@ -175,6 +178,7 @@ export class GitWorkspace implements WorkspacePort {
     patch?: string;
     dropPaths?: string[];
     allowedPaths?: string[];
+    forbiddenPaths?: string[];
     signal?: AbortSignal;
   }): Promise<{ headCommit: string | null; changedFiles: string[] }> {
     input.signal?.throwIfAborted();
@@ -190,9 +194,60 @@ export class GitWorkspace implements WorkspacePort {
     ]);
     if (ancestry.code !== 0)
       throw new SwarmError("Agent discarded its dependency snapshot", "workspace_changed");
+    const committed = await this.git(input.workspace.path, [
+      "diff",
+      "--name-only",
+      "--no-renames",
+      "-z",
+      `${input.workspace.comparisonBaseCommit ?? input.workspace.baseCommit}..HEAD`,
+    ]);
+    if (committed.code !== 0 || committed.truncated)
+      throw new SwarmError("Cannot inspect agent commits", "git");
+    const committedFiles = committed.stdout.split("\0").filter(Boolean);
+    assertUnprotectedPaths(committedFiles, input.forbiddenPaths);
+    if (input.forbiddenPaths?.length) {
+      // Ignored build output is normally allowed, but it cannot add files to protected verifiers.
+      const protectedUntracked = await this.git(
+        input.workspace.path,
+        [
+          "ls-files",
+          "--others",
+          "--full-name",
+          "-z",
+          "--",
+          ...input.forbiddenPaths.map(
+            (area) =>
+              `:(icase,literal)${area.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/+$/, "")}`,
+          ),
+        ],
+        undefined,
+        input.signal,
+      );
+      if (protectedUntracked.code !== 0 || protectedUntracked.truncated)
+        throw new SwarmError("Cannot inspect untracked protected verifier paths", "git");
+      assertUnprotectedPaths(
+        protectedUntracked.stdout.split("\0").filter(Boolean),
+        input.forbiddenPaths,
+      );
+      assertUnprotectedPaths(
+        await this.changedWorktreeFiles(input.workspace.path, "HEAD", input.signal),
+        input.forbiddenPaths,
+      );
+      const before = await this.git(input.workspace.path, [
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+      ]);
+      if (before.code !== 0 || before.truncated)
+        throw new SwarmError("Cannot inspect protected verifier paths", "git");
+      assertUnprotectedPaths(porcelainFiles(before.stdout), input.forbiddenPaths);
+    }
     const patch = input.patch ? normalizePatch(input.patch) : undefined;
     if (patch) {
-      for (const file of validatedPatchPaths(patch)) safeFileTarget(input.workspace.path, file);
+      const patchFiles = validatedPatchPaths(patch);
+      assertUnprotectedPaths(patchFiles, input.forbiddenPaths);
+      for (const file of patchFiles) safeFileTarget(input.workspace.path, file);
     }
     const applyPatch = patch ? materializeNewFiles(input.workspace.path, patch) : undefined;
     if (applyPatch && applyPatch.trim()) {
@@ -220,10 +275,11 @@ export class GitWorkspace implements WorkspacePort {
       "-z",
       "--untracked-files=all",
     ]);
-    if (status.code !== 0) {
+    if (status.code !== 0 || status.truncated) {
       throw new SwarmError(`git status failed: ${status.stderr.trim()}`, "git", true);
     }
     const changedFiles = porcelainFiles(status.stdout);
+    assertUnprotectedPaths(changedFiles, input.forbiddenPaths);
     for (const file of changedFiles) {
       safeFileTarget(input.workspace.path, file);
     }
@@ -244,17 +300,7 @@ export class GitWorkspace implements WorkspacePort {
       throw new SwarmError(`git status failed: ${remainingStatus.stderr.trim()}`, "git", true);
     }
     const remaining = dropped.length ? porcelainFiles(remainingStatus.stdout) : changedFiles;
-    const committed = await this.git(input.workspace.path, [
-      "diff",
-      "--name-only",
-      "--no-renames",
-      "-z",
-      `${input.workspace.comparisonBaseCommit ?? input.workspace.baseCommit}..HEAD`,
-    ]);
-    if (committed.code !== 0) throw new SwarmError("Cannot inspect agent commits", "git");
-    const allChanges = [
-      ...new Set([...remaining, ...committed.stdout.split("\0").filter(Boolean)]),
-    ];
+    const allChanges = [...new Set([...remaining, ...committedFiles])];
     for (const file of allChanges) {
       safeFileTarget(input.workspace.path, file);
       if (
@@ -291,6 +337,87 @@ export class GitWorkspace implements WorkspacePort {
     const head = await this.git(input.workspace.path, ["rev-parse", "HEAD"]);
     if (head.code !== 0) throw new SwarmError("Cannot read worktree HEAD", "git", true);
     return { headCommit: head.stdout.trim(), changedFiles: allChanges };
+  }
+
+  /** Checks only prove the immutable commit they ran against, with no working-tree overrides. */
+  async verifySnapshot(cwd: string, expectedCommit: string, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    const head = await this.git(cwd, ["rev-parse", "HEAD"], undefined, signal);
+    if (head.code !== 0 || head.truncated || head.stdout.trim() !== expectedCommit) {
+      throw new SwarmError(
+        "Verification changed the commit being checked; its result cannot be accepted",
+        "verification_changed",
+      );
+    }
+    if ((await this.changedWorktreeFiles(cwd, expectedCommit, signal)).length > 0) {
+      throw new SwarmError(
+        "Verification changed repository files; its result cannot be accepted",
+        "verification_changed",
+      );
+    }
+    const status = await this.git(
+      cwd,
+      ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+      undefined,
+      signal,
+    );
+    if (status.code !== 0 || status.truncated || status.stdout.length > 0) {
+      throw new SwarmError(
+        "Verification changed repository files; its result cannot be accepted",
+        "verification_changed",
+      );
+    }
+  }
+
+  /** A fresh index hashes actual source bytes, bypassing worker-controlled stat caches and flags. */
+  private async changedWorktreeFiles(
+    cwd: string,
+    commit: string,
+    signal?: AbortSignal,
+  ): Promise<string[]> {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-verify-index-"));
+    const indexFile = path.join(temporary, "index");
+    try {
+      const options = [
+        "-c",
+        "core.sparseCheckout=false",
+        "-c",
+        "core.sparseCheckoutCone=false",
+        "-c",
+        "core.ignoreStat=false",
+      ];
+      const read = await this.git(
+        cwd,
+        [...options, "read-tree", commit],
+        undefined,
+        signal,
+        indexFile,
+      );
+      if (read.code !== 0 || read.truncated)
+        throw new SwarmError("Cannot prepare immutable source comparison", "verification_changed");
+      // The zeroed stat cache forces a content comparison; exit 1 means source files differ.
+      const refresh = await this.git(
+        cwd,
+        [...options, "update-index", "--refresh"],
+        undefined,
+        signal,
+        indexFile,
+      );
+      if ((refresh.code !== 0 && refresh.code !== 1) || refresh.truncated)
+        throw new SwarmError("Cannot refresh immutable source comparison", "verification_changed");
+      const diff = await this.git(
+        cwd,
+        [...options, "diff-files", "--name-only", "--no-renames", "-z"],
+        undefined,
+        signal,
+        indexFile,
+      );
+      if (diff.code !== 0 || diff.truncated)
+        throw new SwarmError("Cannot compare immutable source snapshot", "verification_changed");
+      return diff.stdout.split("\0").filter(Boolean);
+    } finally {
+      fs.rmSync(temporary, { recursive: true, force: true });
+    }
   }
 
   private async dropOwnedByOthers(
@@ -577,6 +704,7 @@ export class GitWorkspace implements WorkspacePort {
     args: string[],
     input?: string,
     signal?: AbortSignal,
+    indexFile?: string,
   ): Promise<CommandResult> {
     signal?.throwIfAborted();
     if (args.some((arg) => arg === "push" || arg.startsWith("push"))) {
@@ -587,6 +715,7 @@ export class GitWorkspace implements WorkspacePort {
     env.GIT_AUTHOR_EMAIL = this.options.authorEmail;
     env.GIT_COMMITTER_NAME = this.options.authorName;
     env.GIT_COMMITTER_EMAIL = this.options.authorEmail;
+    if (indexFile) env.GIT_INDEX_FILE = indexFile;
     try {
       return await runCommand({
         command: "git",
@@ -597,6 +726,10 @@ export class GitWorkspace implements WorkspacePort {
           "commit.gpgsign=false",
           "-c",
           "merge.gpgsign=false",
+          "-c",
+          "core.fsmonitor=false",
+          "-c",
+          "core.untrackedCache=false",
           ...args,
         ],
         cwd,
@@ -833,6 +966,14 @@ export function pathMatchesArea(file: string, area: string): boolean {
   return normalized === key || normalized.startsWith(`${key}/`);
 }
 
+export function assertUnprotectedPaths(files: string[], protectedPaths: string[] = []): void {
+  for (const file of files) {
+    if (protectedPaths.some((area) => pathMatchesArea(file, area) || pathMatchesArea(area, file))) {
+      throw new SwarmError(`Task changed a protected verifier path: ${file}`, "protected_verifier");
+    }
+  }
+}
+
 function porcelainFiles(porcelain: string): string[] {
   const files: string[] = [];
   const entries = porcelain.split("\0");
@@ -926,15 +1067,27 @@ export class MemoryWorkspace implements WorkspacePort {
     return "memory-integration";
   }
 
+  async verifySnapshot(): Promise<void> {
+    return undefined;
+  }
+
   async finalizeRun(input: {
     repoRoot: string;
     workspace: RunWorkspace;
     message: string;
     patch?: string;
     dropPaths?: string[];
+    forbiddenPaths?: string[];
   }): Promise<{ headCommit: string | null; changedFiles: string[] }> {
     if (input.patch) {
       assertSafePatch(input.patch);
+      assertUnprotectedPaths(validatedPatchPaths(input.patch), input.forbiddenPaths);
+    }
+    const existing = (fs.readdirSync(input.workspace.path, { recursive: true }) as string[]).filter(
+      (file) => !fs.lstatSync(path.join(input.workspace.path, file)).isDirectory(),
+    );
+    assertUnprotectedPaths(existing, input.forbiddenPaths);
+    if (input.patch) {
       fs.writeFileSync(path.join(input.workspace.path, "applied.patch"), input.patch, "utf8");
     }
     let files = fs.readdirSync(input.workspace.path);

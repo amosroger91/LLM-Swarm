@@ -8,6 +8,10 @@ Provider errors, invalid patches, no-change results, missing capabilities, and r
 
 If assistance fails, the task waits on a specific decision rather than retrying indefinitely. The caller can give concrete guidance or stop the job. Blocked tasks retain their history. Valid partial file edits can be committed as scoped checkpoints and inherited by the next attempt; a checkpoint never counts as implementation success or approval.
 
+Task verification is enforced by the coordinator after a worker reports completion. The finalized commit is recorded as a scoped checkpoint before checks start, preserving progress across interruption during verification. It remains unverified until the gate passes. A failing selected check records a `task-checks` artifact tied to the commit and keeps dependents blocked. The next bounded attempt inherits the scoped checkpoint and receives the prior check output to diagnose and repair the cause. Check output is diagnostic data; it cannot authorize new commands or relaxed requirements. Attempts that change protected verifier paths or alter the snapshot during verification fail containment checks and are not accepted as repair checkpoints.
+
+Task `verificationChecks` selects configured check indices. Before each handoff, the coordinator reruns the union of the task's selection and every dependency ancestor's selection, catching regressions to prerequisite behavior. Omission by any of them uses all checks. Each selected check must pass with only that task and its dependencies implemented. The commands, protected paths, and required-check policy stay pinned to the job across repair and restart. Legacy jobs pin them on their next execution. Automatic assistance cannot change these definitions or skip the gate.
+
 Native API workers can call `request_help`, `ask_decision`, `post_message`, and `read_coordination` during execution. CLI workers can return messages and proposals with `blocking: true`. Read tools paginate long files and mark incomplete results. Agents must not overwrite a file based on an unseen remainder.
 
 A watchdog reports an absence of observable progress. This is a warning, not proof that a model is deadlocked. File operations, tool completions, and completed provider requests provide progress evidence. Separate deadlines bound each HTTP request, the full agent tool turn, and the job. By default these are 120 seconds, 15 minutes, and 30 minutes respectively. CLI processes retain their configured process deadline.
@@ -42,7 +46,7 @@ maintenance:
 
 The live scheduler runs a sweep every 30 seconds by default. Interrupted jobs and jobs that reached their overall deadline can be resumed without rerunning successful prerequisites. Other failures require their recorded guidance rather than blindly restarting. Cancelled and completed jobs are not automatically restarted. Human-owned pending decisions are left for the caller. Invalid stored plans or exhausted recovery budgets surface clear next actions.
 
-A retry compares its accumulated changes against the original task boundary, while preserving checkpoint ancestry and rechecking ownership. If the first attempt finished the files but lost its final response, the next attempt can validate that existing work without making a meaningless extra edit. Required integration checks and independent review still apply.
+A retry compares its accumulated changes against the original task boundary, while preserving checkpoint ancestry and rechecking ownership. If the first attempt finished the files but lost its final response, the next attempt can validate that existing work without making a meaningless extra edit. Coordinator task verification runs before handoff; every configured integration check and independent review still apply afterward.
 
 An in-process timer cannot revive its own dead process. On Windows, install the external task:
 

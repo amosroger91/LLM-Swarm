@@ -239,7 +239,7 @@ try {
       const tests = { left: leftTests, right: rightTests };
       fs.writeFileSync(
         path.join(root, "verify.mjs"),
-        `import assert from 'node:assert/strict';\nconst tests=${JSON.stringify(tests)};\nfor(const side of ['left','right']) {const fn=(await import('./src/'+side+'.mjs')).default; for(const [input, expected] of tests[side]) {const multi = ${JSON.stringify([left, right])}[side==='left'?0:1].includes('Args:') || ${JSON.stringify([left, right])}[side==='left'?0:1].includes('args:'); assert.deepEqual(fn(...(multi?input:[input])),expected);}}\n`,
+        `import assert from 'node:assert/strict';\nconst tests=${JSON.stringify(tests)};\nconst selected=process.argv[2];\nassert.ok(!selected || ['left','right'].includes(selected), 'Expected left or right');\nfor(const side of selected ? [selected] : ['left','right']) {const fn=(await import('./src/'+side+'.mjs')).default; for(const [input, expected] of tests[side]) {const multi = ${JSON.stringify([left, right])}[side==='left'?0:1].includes('Args:') || ${JSON.stringify([left, right])}[side==='left'?0:1].includes('args:'); assert.deepEqual(fn(...(multi?input:[input])),expected);}}\n`,
       );
       fs.writeFileSync(
         path.join(root, "README.md"),
@@ -248,7 +248,12 @@ try {
       git(root, ["init", "-b", "main"]);
       git(root, ["add", "."]);
       git(root, ["commit", "-m", "benchmark fixture"]);
-      config.checks = [{ command: process.execPath, args: ["verify.mjs"] }];
+      config.checks = ["left", "right"].map((side) => ({
+        name: `${side} acceptance`,
+        command: process.execPath,
+        args: ["verify.mjs", side],
+        protectedPaths: ["verify.mjs"],
+      }));
       config.requireChecks = true;
       const plan = {
         goal: name,
@@ -260,6 +265,7 @@ try {
           title: instruction,
           instructions: `${instruction}. Read verify.mjs. Export a default function from src/${i ? "right" : "left"}.mjs.`,
           acceptanceCriteria: ["Pass acceptance examples"],
+          verificationChecks: [i],
           fileAreas: [`src/${i ? "right" : "left"}.mjs`],
           dependencies: [],
         })),
@@ -287,12 +293,14 @@ try {
             maxReviewRounds: 1,
           });
           jobId = job.id;
+          store.pinVerification(jobId, { checks: config.checks, requireChecks: true });
           const profile = config.profiles[config.defaultProfile]!;
           const agent = config.agents[profile.worker]!;
           const providerConfig = config.providers[agent.provider]!;
           const provider = (await import("../src/providers/registry.js")).createProvider(
             agent.provider,
             providerConfig,
+            (text) => text,
           );
           const tree = await workspace.createRunWorkspace({
             repoRoot: root,
@@ -316,6 +324,7 @@ try {
             tools: workspaceTools({
               root: tree.path,
               allowedPaths: ["src/left.mjs", "src/right.mjs"],
+              protectedPaths: ["verify.mjs"],
               store,
               config,
               jobId,
@@ -328,15 +337,19 @@ try {
             coerceWorkerResult(response.structured ?? extractJsonValue(response.text)),
           );
           if (result.status !== "done") throw new Error(result.summary);
-          await workspace.finalizeRun({
+          const finalized = await workspace.finalizeRun({
             repoRoot: root,
             workspace: tree,
             message: "direct result",
             patch: result.patch,
             allowedPaths: ["src/left.mjs", "src/right.mjs"],
+            forbiddenPaths: ["verify.mjs"],
+            signal,
           });
-          const check = await createChecksRunner(config)(tree.path);
+          const check = await createChecksRunner(config)(tree.path, signal);
           if (!check.ok) throw new Error(check.summary);
+          if (!finalized.headCommit) throw new Error("Direct result has no commit to verify");
+          await workspace.verifySnapshot(tree.path, finalized.headCommit, signal);
           store.transitionJob(jobId, "completed");
           status = "completed";
         } else {
@@ -376,7 +389,7 @@ try {
         JSON.stringify(
           {
             method:
-              "Controlled two-task plan; direct has no planner/reviewer; pipeline modes share checks and reviewer. Synthetic music-domain helpers, not whole-app tasks. No human fixes during a trial.",
+              "Controlled two-task plan with protected acceptance checks; direct has no planner/reviewer; pipeline modes use scoped task checks and share final checks and reviewer. All accepted results preserve the checked commit. Synthetic music-domain helpers, not whole-app tasks. No human fixes during a trial.",
             results,
           },
           null,

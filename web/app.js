@@ -128,6 +128,8 @@ function timeline(events = detail.events.slice(-18)) {
 }
 function overview() {
   const active = detail.runs.filter((run) => ["running", "queued"].includes(run.status));
+  const checkCount = detail.job.verification?.checks.length ?? state.checkCount;
+  const requireChecks = detail.job.verification?.requireChecks ?? state.requireChecks;
   return `${blockers()}<div class="overview-grid"><section class="panel"><div class="section-title"><h2>Agent activity</h2><span>${active.length} active</span></div>${
     active.length
       ? active
@@ -137,13 +139,20 @@ function overview() {
           })
           .join("")
       : '<div class="panel-empty"><span>◈</span><p>No agents executing right now.<br>Queued work starts when dependencies are ready.</p></div>'
-  }<div class="supervisor-note"><span class="live-dot"></span><div><strong>${state.maintenance.enabled ? "Goal supervisor is on" : "Automatic supervision is off"}</strong><p>${state.maintenance.enabled ? `Recovery sweep every ${Math.round(state.maintenance.intervalMs / 1000)}s. Answers supported questions and resumes interrupted work.` : "Use the recovery sweep button to inspect pending work."}</p></div></div></section><section class="panel"><div class="section-title"><h2>Verification</h2><span>Evidence before approval</span></div><div class="verification-row"><span>Configured checks</span><strong>${state.checkCount ? `${state.checkCount} commands` : "None configured"}</strong></div><div class="verification-row"><span>Checks required</span><strong>${state.requireChecks ? "Yes" : "No"}</strong></div><div class="verification-row"><span>Review state</span>${badge(detail.job.reviewState ?? "pending")}</div><div class="verification-row"><span>Review rounds</span><strong>${detail.reviews.length} / ${detail.job.maxReviewRounds}</strong></div>${detail.artifacts
-    .filter((item) => item.kind === "checks")
-    .slice(-1)
-    .map((item) => `<pre class="check-evidence">${escape(short(item.summary, 500))}</pre>`)
+  }<div class="supervisor-note"><span class="live-dot"></span><div><strong>${state.maintenance.enabled ? "Goal supervisor is on" : "Automatic supervision is off"}</strong><p>${state.maintenance.enabled ? `Recovery sweep every ${Math.round(state.maintenance.intervalMs / 1000)}s. Answers supported questions and resumes interrupted work.` : "Use the recovery sweep button to inspect pending work."}</p></div></div></section><section class="panel"><div class="section-title"><h2>Verification</h2><span>Evidence before approval</span></div><div class="verification-row"><span>Configured checks</span><strong>${checkCount ? `${checkCount} commands` : "None configured"}</strong></div><div class="verification-row"><span>Checks required</span><strong>${requireChecks ? "Yes" : "No"}</strong></div><div class="verification-row"><span>Review state</span>${badge(detail.job.reviewState ?? "pending")}</div><div class="verification-row"><span>Review rounds</span><strong>${detail.reviews.length} / ${detail.job.maxReviewRounds}</strong></div>${detail.artifacts
+    .filter((item) => ["checks", "task-checks", "dependency-checks"].includes(item.kind))
+    .slice(-4)
+    .map((item) => {
+      const task = detail.tasks.find((entry) => entry.id === item.taskId);
+      const label =
+        item.kind === "checks"
+          ? "Integration checks"
+          : `${item.kind === "dependency-checks" ? "Dependencies for" : "Task"} ${task?.stableId ?? item.taskId}`;
+      return `<div class="verification-row"><span>${escape(label)}</span><time>${date(item.createdAt)}</time></div><pre class="check-evidence">${escape(short(item.summary, 500))}</pre>`;
+    })
     .join(
       "",
-    )}<p class="small-note">A planner’s answer or worker’s success does not complete the mission. Checks and independent review remain the gate.</p></section></div><section class="panel recent-panel"><div class="section-title"><h2>Recent events</h2><button class="text-button" data-tab="activity">View full activity ↗</button></div>${timeline()}</section>`;
+    )}<p class="small-note">Task checks gate every handoff. All integration checks and independent review determine completion. Full check records are in Artifacts.</p></section></div><section class="panel recent-panel"><div class="section-title"><h2>Recent events</h2><button class="text-button" data-tab="activity">View full activity ↗</button></div>${timeline()}</section>`;
 }
 function tasksView() {
   const idMap = new Map(detail.tasks.map((task) => [task.id, task]));

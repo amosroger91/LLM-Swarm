@@ -7,17 +7,17 @@ import type { SwarmConfig } from "../config/schema.js";
 import { safeFileTarget } from "../safety/files.js";
 import { allowlistedEnv } from "../safety/redact.js";
 import { resolveExecutable, runCommand } from "../safety/process.js";
+import { assertUnprotectedPaths, pathMatchesArea } from "../git/workspace.js";
 
 const excluded =
   /(?:^|\/)(?:\.git|\.swarm-data|workspaces|node_modules|dist|coverage|secrets?|credentials?|certs?|\.ssh|\.aws|\.azure|\.npmrc|\.netrc|\.pypirc|\.env[^/]*)(?:\/|$)|(?:secret|credential|token)[^/]*\.(?:json|ya?ml|txt)$|\.(?:pem|key|pfx|p12|crt|db|sqlite)$/i;
-const matches = (file: string, area: string): boolean =>
-  file === area || file.startsWith(`${area}/`);
 
 /** All operations are bounded and scoped to an assigned checkout. No agent-supplied shell. */
 export function workspaceTools(input: {
   root: string;
   ref?: string;
   allowedPaths?: string[];
+  protectedPaths?: string[];
   readOnly?: boolean;
   store: Store;
   config: SwarmConfig;
@@ -225,7 +225,11 @@ export function workspaceTools(input: {
       async (args) => {
         const file = args.path as string;
         const destination = target(file);
-        if (input.allowedPaths?.length && !input.allowedPaths.some((area) => matches(file, area)))
+        assertUnprotectedPaths([file], input.protectedPaths);
+        if (
+          input.allowedPaths?.length &&
+          !input.allowedPaths.some((area) => pathMatchesArea(file, area))
+        )
           throw new Error(`Unowned file: ${file}`);
         fs.mkdirSync(path.dirname(destination), { recursive: true });
         fs.writeFileSync(destination, args.content as string, "utf8");

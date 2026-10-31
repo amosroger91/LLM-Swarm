@@ -316,4 +316,10 @@ CREATE TABLE delegations (
 CREATE INDEX idx_delegations_time ON delegations(created_at);
 `,
   },
+  {
+    version: 11,
+    name: "task_verification_checks",
+    sql: `ALTER TABLE tasks ADD COLUMN verification_checks_json TEXT;
+    ALTER TABLE jobs ADD COLUMN verification_json TEXT;`,
+  },
 ];

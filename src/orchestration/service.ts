@@ -31,7 +31,13 @@ import type {
   PlannerChatRecord,
 } from "../db/store.js";
 import { combineSignals, withTimeout } from "./async.js";
-import { createChecksRunner, type ChecksRunner } from "./checks.js";
+import {
+  createChecksRunner,
+  createTaskChecksRunner,
+  type ChecksRunner,
+  type TaskChecksRunner,
+  type CheckRunResult,
+} from "./checks.js";
 import {
   ReviewResultSchema,
   WorkerResultSchema,
@@ -133,7 +139,8 @@ export class Orchestrator {
   private readonly inflight = new Map<string, Promise<void>>();
   private readonly controllers = new Map<string, AbortController>();
   private readonly logger: Logger;
-  private readonly checks: ChecksRunner;
+  private readonly checks?: ChecksRunner;
+  private readonly taskChecks?: TaskChecksRunner;
   private readonly supervision = new Set<string>();
   private readonly maintenanceTimer: ReturnType<typeof setInterval> | undefined;
   private maintenanceRunning = false;
@@ -146,10 +153,16 @@ export class Orchestrator {
     private readonly config: SwarmConfig,
     private readonly workspace: WorkspacePort,
     private readonly providers: ProviderResolver,
-    options: { logger?: Logger; checks?: ChecksRunner; recoverOnStart?: boolean } = {},
+    options: {
+      logger?: Logger;
+      checks?: ChecksRunner;
+      taskChecks?: TaskChecksRunner;
+      recoverOnStart?: boolean;
+    } = {},
   ) {
     this.logger = options.logger ?? silentLogger;
-    this.checks = options.checks ?? createChecksRunner(config);
+    this.checks = options.checks;
+    this.taskChecks = options.taskChecks;
     this.store.acquireScheduler();
     if (options.recoverOnStart !== false) {
       const recovered = this.store.recoverInterrupted();
@@ -185,7 +198,8 @@ export class Orchestrator {
   }
 
   async startJob(input: StartJobInput): Promise<{ job_id: string; status: string }> {
-    const suppliedPlan = input.plan === undefined ? undefined : validatePlan(input.plan);
+    const suppliedPlan =
+      input.plan === undefined ? undefined : validatePlan(input.plan, this.config.checks.length);
     if (suppliedPlan && !suppliedPlan.ok)
       throw new SwarmError(suppliedPlan.errors.join("; "), "bad_plan");
     const profileName = input.configProfile ?? this.config.defaultProfile;
@@ -206,6 +220,7 @@ export class Orchestrator {
       maxAttempts: this.config.defaultMaxAttempts,
       maxReviewRounds: this.config.maxReviewRounds,
     });
+    this.verificationConfig(job.id);
     this.store.insertProfiles(job.id, this.profileSnapshots(profile));
     if (suppliedPlan?.ok) this.acceptPlan(job.id, suppliedPlan.plan);
     this.store.postMessage({
@@ -230,7 +245,10 @@ export class Orchestrator {
     if (this.inflight.has(jobId)) throw new SwarmError("Job is already executing", "bad_state");
     const job = this.store.mustJob(jobId);
     if (job.planJson) {
-      const plan = validatePlan(JSON.parse(job.planJson));
+      const plan = validatePlan(
+        JSON.parse(job.planJson),
+        this.verificationConfig(jobId).checks.length,
+      );
       if (!plan.ok)
         throw new SwarmError(
           `Stored plan must be corrected in a new job: ${plan.errors.join("; ")}`,
@@ -306,7 +324,10 @@ export class Orchestrator {
             try {
               const value = readJson(response);
               if (metadata.role === "planner") {
-                const plan = validatePlan(value);
+                const plan = validatePlan(
+                  value,
+                  this.verificationConfig(metadata.jobId!).checks.length,
+                );
                 if (!plan.ok) throw new Error(plan.errors.join("; "));
               } else if (metadata.role === "worker")
                 WorkerResultSchema.parse(coerceWorkerResult(value));
@@ -381,32 +402,55 @@ export class Orchestrator {
       : this.config.providerTimeoutMs;
   }
 
+  /** Check commands and protections are frozen before implementation begins. */
+  private verificationConfig(jobId: string): SwarmConfig {
+    return {
+      ...this.config,
+      ...this.store.pinVerification(jobId, {
+        checks: this.config.checks,
+        requireChecks: this.config.requireChecks,
+      }),
+    };
+  }
+
+  private protectedVerificationPaths(jobId: string): string[] {
+    return [
+      ...new Set(
+        this.verificationConfig(jobId).checks.flatMap((check) => check.protectedPaths ?? []),
+      ),
+    ];
+  }
+
   private extendedPlan(jobId: string, additions: unknown[], contracts: string[]): Plan {
     const job = this.store.mustJob(jobId);
     const tasks = this.store.listTasks(jobId).filter((task) => task.kind === "implementation");
     const byId = new Map(tasks.map((task) => [task.id, task.stableId]));
     const dependencies = this.store.dependencyMap(jobId);
-    const validated = validatePlan({
-      goal: job.goal ?? job.task.slice(0, 2000),
-      completionCriteria: job.completionCriteria.length
-        ? job.completionCriteria
-        : ["Meet the user's request"],
-      questions: [],
-      contracts,
-      tasks: [
-        ...tasks.map((task) => ({
-          id: task.stableId,
-          title: task.title,
-          instructions: task.instructions.slice(0, 8000),
-          acceptanceCriteria: task.acceptanceCriteria,
-          fileAreas: task.fileAreas,
-          dependencies: (dependencies.get(task.id) ?? []).flatMap((id) =>
-            byId.has(id) ? [byId.get(id)!] : [],
-          ),
-        })),
-        ...additions,
-      ],
-    });
+    const validated = validatePlan(
+      {
+        goal: job.goal ?? job.task.slice(0, 2000),
+        completionCriteria: job.completionCriteria.length
+          ? job.completionCriteria
+          : ["Meet the user's request"],
+        questions: [],
+        contracts,
+        tasks: [
+          ...tasks.map((task) => ({
+            id: task.stableId,
+            title: task.title,
+            instructions: task.instructions.slice(0, 8000),
+            acceptanceCriteria: task.acceptanceCriteria,
+            verificationChecks: task.verificationChecks,
+            fileAreas: task.fileAreas,
+            dependencies: (dependencies.get(task.id) ?? []).flatMap((id) =>
+              byId.has(id) ? [byId.get(id)!] : [],
+            ),
+          })),
+          ...additions,
+        ],
+      },
+      this.verificationConfig(jobId).checks.length,
+    );
     if (!validated.ok) throw new SwarmError(validated.errors.join("; "), "bad_plan");
     return validated.plan;
   }
@@ -544,6 +588,7 @@ export class Orchestrator {
           title: task.title,
           instructions: `${task.instructions}\nShared contracts:\n${plan.contracts.join("\n")}`,
           acceptanceCriteria: task.acceptanceCriteria,
+          verificationChecks: task.verificationChecks,
           fileAreas: task.fileAreas,
           dependencies: task.dependencies,
         })),
@@ -1169,6 +1214,7 @@ export class Orchestrator {
               context: sourceContext,
               profiles,
               repairErrors,
+              checks: this.verificationConfig(jobId).checks,
             }),
             this.config.maxPromptChars,
           ),
@@ -1195,7 +1241,7 @@ export class Orchestrator {
       lastOutput = response.text.slice(0, this.config.maxResponseChars);
       let validated: ReturnType<typeof validatePlan>;
       try {
-        validated = validatePlan(readJson(response));
+        validated = validatePlan(readJson(response), this.verificationConfig(jobId).checks.length);
       } catch (error) {
         validated = { ok: false, errors: [errorMessage(error)] };
       }
@@ -1238,6 +1284,7 @@ export class Orchestrator {
         title: task.title,
         instructions: `${task.instructions}${plan.contracts.length ? `\n\nShared interface contracts:\n${plan.contracts.join("\n")}` : ""}`,
         acceptanceCriteria: task.acceptanceCriteria,
+        verificationChecks: task.verificationChecks,
         dependencies: task.dependencies,
         suggestedRole: task.suggestedRole,
         fileAreas: task.fileAreas,
@@ -1336,7 +1383,15 @@ export class Orchestrator {
         }
         const counts = this.store.taskCounts(jobId);
         if (counts.failed > 0 && counts.ready === 0 && counts.running === 0) {
-          this.fail(jobId, "One or more tasks failed and nothing is left to run.");
+          const failures = this.store
+            .listTasks(jobId)
+            .filter((task) => task.status === "failed" && task.error)
+            .map((task) => `${task.stableId}: ${task.error}`)
+            .join("\n");
+          this.fail(
+            jobId,
+            `One or more tasks failed and nothing is left to run.\n${failures}`.slice(0, 8000),
+          );
           return "failed";
         }
         return "continue";
@@ -1439,6 +1494,44 @@ export class Orchestrator {
         workspacePath.comparisonBaseCommit = original?.baseCommit ?? workspacePath.baseCommit;
       }
       this.store.attachWorkspace(claim.run.id, workspacePath);
+      const verificationConfig = this.verificationConfig(jobId);
+      const ancestors = this.store.listTasks(jobId).filter((task) => dependencyIds.has(task.id));
+      const artifacts = this.store.listArtifacts(jobId);
+      const needsDependencyProof =
+        claim.task.kind !== "revision" &&
+        ancestors.some((task) => {
+          const dependencyCommit = [...worktrees]
+            .reverse()
+            .find((tree) => tree.taskId === task.id && tree.headCommit)?.headCommit;
+          return !artifacts.some((artifact) => {
+            if (artifact.taskId !== task.id || artifact.kind !== "task-checks") return false;
+            const evidence = parseCheckEvidence(artifact.summary);
+            return (
+              evidence.commit === dependencyCommit &&
+              (evidence.status === "passed" ||
+                (evidence.status === "not_run" && !verificationConfig.requireChecks))
+            );
+          });
+        });
+      if (needsDependencyProof) {
+        const indices = [
+          ...new Set(
+            ancestors.flatMap(
+              (task) =>
+                task.verificationChecks ?? verificationConfig.checks.map((_, index) => index),
+            ),
+          ),
+        ].sort((a, b) => a - b);
+        await this.verifyTask(
+          jobId,
+          claim,
+          workspacePath.path,
+          workspacePath.baseCommit,
+          indices,
+          signal,
+          "dependency-checks",
+        );
+      }
       const provider = this.providers.forProfile(profile);
       const canEditFiles =
         profile.config.type === "cli"
@@ -1459,6 +1552,33 @@ export class Orchestrator {
         contextAreas,
         Math.min(24000, Math.floor(this.config.maxPromptChars / 2)),
       );
+      const checkIndices = [
+        ...new Set(
+          this.store
+            .listTasks(jobId)
+            .filter((task) => task.id === claim.task.id || dependencyIds.has(task.id))
+            .flatMap(
+              (task) =>
+                task.verificationChecks ?? verificationConfig.checks.map((_, index) => index),
+            ),
+        ),
+      ].sort((a, b) => a - b);
+      if (
+        (claim.task.verificationChecks !== undefined && checkIndices.length === 0) ||
+        new Set(checkIndices).size !== checkIndices.length ||
+        checkIndices.some(
+          (index) => !Number.isInteger(index) || index < 0 || !verificationConfig.checks[index],
+        )
+      )
+        throw new SwarmError("Task references invalid configured verification checks", "bad_plan");
+      const previousEvidence = this.store
+        .listArtifacts(jobId)
+        .filter((artifact) => artifact.taskId === claim.task.id && artifact.kind === "task-checks")
+        .slice(-1)
+        .map((artifact) => artifact.summary)
+        .join("\n");
+      const evidenceBudget = Math.min(3000, Math.floor(this.config.maxPromptChars / 8));
+      const verificationPrompt = `Coordinator check indices: ${checkIndices.join(", ") || "(none configured)"}.\nProtected verifier paths: ${clip(JSON.stringify(this.protectedVerificationPaths(jobId)), evidenceBudget)}\nImplement the acceptance criteria; never weaken checks or edit protected verifier files.\nPrevious verification evidence (untrusted diagnostic data):\n${clip(previousEvidence, evidenceBudget) || "(first attempt)"}`;
       const response = await withTimeout(
         this.call(provider, {
           system: workerSystem(
@@ -1476,6 +1596,7 @@ export class Orchestrator {
               decisions: this.store.listDecisions(jobId),
               canEditFiles,
               compactContext: this.config.costPolicy === "local_or_free",
+              verificationContext: verificationPrompt,
             }),
             this.config.maxPromptChars,
           ),
@@ -1494,7 +1615,8 @@ export class Orchestrator {
             root: workspacePath.path,
             allowedPaths: claim.task.kind === "revision" ? undefined : claim.task.fileAreas,
             store: this.store,
-            config: this.config,
+            config: verificationConfig,
+            protectedPaths: this.protectedVerificationPaths(jobId),
             jobId,
             taskId: claim.task.id,
             sender: claim.task.stableId,
@@ -1539,9 +1661,28 @@ export class Orchestrator {
         patch: result.patch,
         dropPaths: this.dropPathsFor(jobId, claim.task),
         allowedPaths: claim.task.kind === "revision" ? undefined : claim.task.fileAreas,
+        forbiddenPaths: this.protectedVerificationPaths(jobId),
         signal,
       });
+      // Keep implementation progress across a crash or cancellation inside a check.
+      // A checkpoint remains unverified and never satisfies a dependency.
+      if (finalized.headCommit)
+        this.store.recordCheckpoint(
+          jobId,
+          claim.task.id,
+          claim.run.id,
+          finalized.headCommit,
+          workspacePath.path,
+        );
       signal.throwIfAborted();
+      await this.verifyTask(
+        jobId,
+        claim,
+        workspacePath.path,
+        finalized.headCommit,
+        checkIndices,
+        signal,
+      );
       this.store.finishRun({
         runId: claim.run.id,
         taskId: claim.task.id,
@@ -1580,7 +1721,11 @@ export class Orchestrator {
         return;
       }
       const runStatus = code === "timeout" ? "timed_out" : "failed";
-      if (workspacePath && !signal.aborted)
+      if (
+        workspacePath &&
+        !signal.aborted &&
+        !["protected_verifier", "verification_changed", "workspace_changed"].includes(code)
+      )
         await this.checkpoint(jobId, claim, workspacePath, signal);
       const action = await this.handleBlocker(
         jobId,
@@ -1603,6 +1748,65 @@ export class Orchestrator {
     }
   }
 
+  private async verifyTask(
+    jobId: string,
+    claim: Claim,
+    cwd: string,
+    commit: string | null,
+    checkIndices: number[],
+    signal: AbortSignal,
+    kind: "task-checks" | "dependency-checks" = "task-checks",
+  ): Promise<void> {
+    const config = this.verificationConfig(jobId);
+    const record = (result: CheckRunResult): void => {
+      const status = result.status ?? (result.ok ? "passed" : "failed");
+      this.store.insertArtifact({
+        jobId,
+        taskId: claim.task.id,
+        runId: claim.run.id,
+        kind,
+        path: cwd,
+        summary: JSON.stringify({ status, summary: result.summary, commit, checkIndices }),
+      });
+      this.store.addEvent(jobId, "task.verification_finished", "task", claim.task.id, {
+        runId: claim.run.id,
+        commit,
+        checkIndices,
+        status,
+      });
+    };
+    let result: CheckRunResult;
+    try {
+      result = await (this.taskChecks ?? createTaskChecksRunner(config))(cwd, checkIndices, signal);
+      signal.throwIfAborted();
+      if (!commit && checkIndices.length > 0)
+        throw new SwarmError("Task has no commit to verify", "verification_changed");
+      if (commit) await this.workspace.verifySnapshot(cwd, commit, signal);
+    } catch (error) {
+      record({ ok: false, status: "failed", summary: errorMessage(error) });
+      throw error;
+    }
+    // An empty selection can never count as passing, including injected runners.
+    if (checkIndices.length === 0)
+      result = {
+        ok: true,
+        status: "not_run",
+        summary: "NOT RUN: No checks configured. This is not a passing test result.",
+      };
+    record(result);
+    if (result.status === "not_run" && config.requireChecks)
+      throw new SwarmError(
+        "No checks configured for task verification. Configure checks before handing work to dependents.",
+        "task_checks_missing",
+      );
+    if (!result.ok || result.status === "failed")
+      throw new SwarmError(
+        `Task verification failed:\n${result.summary}`,
+        "task_checks_failed",
+        true,
+      );
+  }
+
   private async checkpoint(
     jobId: string,
     claim: Claim,
@@ -1618,6 +1822,7 @@ export class Orchestrator {
         message: `swarm: checkpoint ${claim.task.stableId} attempt ${claim.task.attemptCount}`,
         dropPaths: this.dropPathsFor(jobId, claim.task),
         allowedPaths: claim.task.kind === "revision" ? undefined : claim.task.fileAreas,
+        forbiddenPaths: this.protectedVerificationPaths(jobId),
         signal,
       });
       if (result.headCommit)
@@ -1670,7 +1875,17 @@ export class Orchestrator {
     });
     if (signal.aborted || !this.config.recovery.enabled)
       return retryable && remaining ? "retry" : "fail";
-    if (["unsafe_path", "workspace_changed", "bad_repo"].includes(category)) {
+    if (
+      [
+        "unsafe_path",
+        "workspace_changed",
+        "bad_repo",
+        "protected_verifier",
+        "verification_changed",
+        "task_checks_missing",
+        "bad_plan",
+      ].includes(category)
+    ) {
       this.store.updateBlocker(blocker.id, {
         status: "open",
         nextAction:
@@ -1919,8 +2134,14 @@ export class Orchestrator {
       );
       return "failed";
     }
-    const checks = await this.checks(integration.path, signal);
+    const verificationConfig = this.verificationConfig(jobId);
+    const checks = await (this.checks ?? createChecksRunner(verificationConfig))(
+      integration.path,
+      signal,
+    );
     signal.throwIfAborted();
+    if (integration.headCommit)
+      await this.workspace.verifySnapshot(integration.path, integration.headCommit, signal);
     this.store.insertArtifact({
       jobId,
       kind: "checks",
@@ -1938,7 +2159,7 @@ export class Orchestrator {
       this.store.transitionJob(jobId, "running", { reviewState: "pending" });
       return "revise";
     }
-    if (checks.status === "not_run" && this.config.requireChecks) {
+    if (checks.status === "not_run" && verificationConfig.requireChecks) {
       this.fail(
         jobId,
         "No checks configured. Configure checks or explicitly set requireChecks: false for an unverified run.",
@@ -1975,6 +2196,9 @@ export class Orchestrator {
     const parsed = {
       data: await this.obtainReview(jobId, profile, reviewPrompt, integration, signal),
     };
+    signal.throwIfAborted();
+    if (integration.headCommit)
+      await this.workspace.verifySnapshot(integration.path, integration.headCommit, signal);
     if (this.store.mustJob(jobId).status === "cancel_requested") {
       this.finishCancelled(jobId);
       return "failed";
@@ -2312,6 +2536,14 @@ export class Orchestrator {
       integrationBranch: job.integrationBranch,
       baseCommit: job.baseCommit,
       measurements: this.store.measurements(jobId),
+      taskChecks: this.store
+        .listArtifacts(jobId)
+        .filter((item) => item.kind === "task-checks")
+        .map((item) => ({
+          taskId: item.taskId,
+          runId: item.runId,
+          ...parseCheckEvidence(item.summary),
+        })),
       blockers: this.store.listBlockers(jobId),
       workspaces: this.store
         .listWorktrees(jobId)
@@ -2400,6 +2632,21 @@ function topological(tasks: TaskRecord[], dependencies: Map<string, string[]>): 
   };
   for (const task of tasks) visit(task);
   return ordered;
+}
+
+function parseCheckEvidence(summary: string): Record<string, unknown> {
+  try {
+    const value: unknown = JSON.parse(summary);
+    if (value && typeof value === "object" && !Array.isArray(value))
+      return value as Record<string, unknown>;
+  } catch {
+    // Historical/truncated evidence is diagnostic data, never proof of a pass.
+  }
+  return {
+    status: "failed",
+    summary: "Invalid stored verification evidence; fresh checks are required.",
+    excerpt: summary.slice(0, 2000),
+  };
 }
 
 export function statusPayload(store: Store, jobId: string): Record<string, unknown> {

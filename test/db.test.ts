@@ -130,6 +130,7 @@ describe("database", () => {
       { version: 8, name: "provider_fallback_snapshots" },
       { version: 9, name: "durable_planner_chat" },
       { version: 10, name: "delegations" },
+      { version: 11, name: "task_verification_checks" },
     ]);
     expect(db.pragma("foreign_keys", { simple: true })).toBe(1);
     expect(String(db.pragma("journal_mode", { simple: true }))).toBe("wal");
